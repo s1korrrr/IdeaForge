@@ -223,11 +223,29 @@ class PublicSourceSnapshotTests(unittest.TestCase):
         self.write("Sources/Leak.txt", private_path)
         self.git("add", "-A")
         self.git("commit", "-m", "add privacy leak")
+        fake_bin = self.temporary_root / "fake-init-bin"
+        fake_bin.mkdir()
+        init_log = self.temporary_root / "git-init.log"
+        fake_git = fake_bin / "git"
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        fake_git.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-C" ] && [ "$3" = "init" ]; then\n'
+            f"  printf '%s\\n' \"$2\" >> {shlex.quote(str(init_log))}\n"
+            "fi\n"
+            f"exec {shlex.quote(real_git)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
 
-        result = self.run_snapshot()
+        result = self.run_snapshot(environment=environment)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("public-source audit", result.stderr.lower())
+        self.assertFalse(init_log.exists(), "git init ran before the public-source audit passed")
         self.assertFalse(self.destination.exists())
 
 
