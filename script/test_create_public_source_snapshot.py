@@ -231,9 +231,12 @@ class PublicSourceSnapshotTests(unittest.TestCase):
         self.assertIsNotNone(real_git)
         fake_git.write_text(
             "#!/bin/sh\n"
-            'if [ "$1" = "-C" ] && [ "$3" = "init" ]; then\n'
-            f"  printf '%s\\n' \"$2\" >> {shlex.quote(str(init_log))}\n"
-            "fi\n"
+            'for argument in "$@"; do\n'
+            '  if [ "$argument" = "init" ]; then\n'
+            f"    printf 'init\\n' >> {shlex.quote(str(init_log))}\n"
+            "    break\n"
+            "  fi\n"
+            "done\n"
             f"exec {shlex.quote(real_git)} \"$@\"\n",
             encoding="utf-8",
         )
