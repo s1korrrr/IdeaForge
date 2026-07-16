@@ -17,6 +17,13 @@ public enum RecordingTransferStatus: String, Codable, Equatable, Sendable {
 }
 
 public struct RecordingTransferMetadata: Codable, Equatable, Sendable {
+    private static let maximumIdentifierLength = 128
+    private static let maximumDeviceNameLength = 128
+    private static let maximumLanguageHintLength = 32
+    private static let maximumDurationSeconds = 24 * 60 * 60
+    private static let maximumMarkerCount = 1_024
+    private static let earliestPlausibleCreationDate = Date(timeIntervalSince1970: 978_307_200)
+    private static let maximumFutureSkew: TimeInterval = 60 * 60
     public var recordingID: String
     public var ideaProjectID: String
     public var sourceDeviceName: String
@@ -55,6 +62,24 @@ public struct RecordingTransferMetadata: Codable, Equatable, Sendable {
         )
     }
 
+    public var isValid: Bool {
+        Self.isSafeIdentifier(recordingID)
+            && Self.isSafeIdentifier(ideaProjectID)
+            && !sourceDeviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && sourceDeviceName.count <= Self.maximumDeviceNameLength
+            && !languageHint.isEmpty
+            && languageHint.count <= Self.maximumLanguageHintLength
+            && languageHint.unicodeScalars.allSatisfy {
+                CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_"
+            }
+            && (0...Self.maximumDurationSeconds).contains(durationSeconds)
+            && markerOffsets.count <= Self.maximumMarkerCount
+            && markerOffsets.allSatisfy { (0...durationSeconds).contains($0) }
+            && createdAt.timeIntervalSince1970.isFinite
+            && createdAt >= Self.earliestPlausibleCreationDate
+            && createdAt <= Date().addingTimeInterval(Self.maximumFutureSkew)
+    }
+
     public var watchConnectivityMetadata: [String: Any] {
         [
             "recordingID": recordingID,
@@ -78,7 +103,7 @@ public struct RecordingTransferMetadata: Codable, Equatable, Sendable {
             return nil
         }
 
-        self.init(
+        let decoded = Self(
             recordingID: recordingID,
             ideaProjectID: ideaProjectID,
             sourceDeviceName: sourceDeviceName,
@@ -87,6 +112,20 @@ public struct RecordingTransferMetadata: Codable, Equatable, Sendable {
             markerOffsets: markerOffsets,
             createdAt: Date(timeIntervalSince1970: createdAtSeconds)
         )
+        guard decoded.isValid else { return nil }
+        self = decoded
+    }
+
+    static func isSafeIdentifier(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value.count <= maximumIdentifierLength,
+              value != ".",
+              value != ".." else {
+            return false
+        }
+        return value.unicodeScalars.allSatisfy {
+            CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_" || $0 == "."
+        }
     }
 }
 
@@ -127,7 +166,7 @@ public struct RecordingTransferImportAcknowledgement: Equatable, Sendable {
     public init?(watchConnectivityUserInfo userInfo: [String: Any]) {
         guard userInfo["messageType"] as? String == Self.messageType,
               let recordingID = userInfo["recordingID"] as? String,
-              !recordingID.isEmpty,
+              RecordingTransferMetadata.isSafeIdentifier(recordingID),
               let rawResult = userInfo["result"] as? String,
               let result = RecordingTransferImportResult(rawValue: rawResult) else {
             return nil
@@ -146,22 +185,47 @@ enum RecordingTransferCompletionPolicy {
     }
 }
 
+enum RecordingTransferQueuePolicy {
+    static func shouldQueue(
+        recordingID: String,
+        sessionIsActivated: Bool,
+        outstandingRecordingIDs: Set<String>
+    ) -> Bool {
+        sessionIsActivated && !outstandingRecordingIDs.contains(recordingID)
+    }
+}
+
+enum RecordingTransferReachabilityPolicy {
+    static func isReachable(
+        sessionIsActivated: Bool,
+        companionIsAvailable: Bool,
+        sessionIsReachable: Bool
+    ) -> Bool {
+        sessionIsActivated && companionIsAvailable && sessionIsReachable
+    }
+}
+
 public enum RecordingTransferError: Error, Equatable {
     case unsupportedPlatform
     case missingLocalAudioFile
     case inactiveSession
     case receivedFileStageFailed
+    case invalidMetadata
 }
 
 public protocol RecordingTransferService {
     @MainActor func activate()
     @MainActor func transfer(recording: Recording) throws -> RecordingTransferReceipt
     @MainActor func setTransferCompletionHandler(_ handler: RecordingTransferCompletionHandler?)
+    @MainActor func setReachabilityHandler(_ handler: RecordingTransferReachabilityHandler?)
 }
 
 extension RecordingTransferService {
     @MainActor
     public func setTransferCompletionHandler(_ handler: RecordingTransferCompletionHandler?) {}
+
+    @MainActor
+    public func setReachabilityHandler(_ handler: RecordingTransferReachabilityHandler?) {}
 }
 
 public typealias RecordingTransferReceiveHandler = @MainActor @Sendable (URL, RecordingTransferMetadata) async -> RecordingTransferImportResult
@@ -169,6 +233,7 @@ public typealias RecordingTransferReceiveHandler = @MainActor @Sendable (URL, Re
 /// Called after transport fails or the receiving app acknowledges its import.
 /// `imported` is true only after the recording is durable in the receiving workspace.
 public typealias RecordingTransferCompletionHandler = @MainActor @Sendable (_ recordingID: String, _ imported: Bool) -> Void
+public typealias RecordingTransferReachabilityHandler = @MainActor @Sendable (_ isReachable: Bool) -> Void
 
 public struct UnavailableRecordingTransferService: RecordingTransferService {
     public init() {}
@@ -192,12 +257,21 @@ enum RecordingTransferFileStager {
         guard fileManager.fileExists(atPath: sourceURL.path) else {
             throw RecordingTransferError.missingLocalAudioFile
         }
+        let attributes = try fileManager.attributesOfItem(atPath: sourceURL.path)
+        guard attributes[.type] as? FileAttributeType == .typeRegular else {
+            throw RecordingTransferError.missingLocalAudioFile
+        }
 
         let root = rootDirectory
             ?? fileManager.temporaryDirectory.appending(path: "IdeaForge/WatchConnectivity/Received", directoryHint: .isDirectory)
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
 
-        let fileExtension = sourceURL.pathExtension.isEmpty ? "m4a" : sourceURL.pathExtension
+        guard metadata.isValid else { throw RecordingTransferError.invalidMetadata }
+        let candidateExtension = sourceURL.pathExtension.lowercased()
+        let fileExtension = candidateExtension.isEmpty || candidateExtension.count > 10
+            || !candidateExtension.unicodeScalars.allSatisfy(CharacterSet.alphanumerics.contains)
+            ? "m4a"
+            : candidateExtension
         let destinationURL = root.appending(
             path: "\(metadata.recordingID)-\(UUID().uuidString).\(fileExtension)"
         )
@@ -242,6 +316,8 @@ public final class WatchConnectivityRecordingTransferService: NSObject, Recordin
     private let session: WCSession?
     private let receiveHandler: RecordingTransferReceiveHandler?
     @MainActor private var transferCompletionHandler: RecordingTransferCompletionHandler?
+    @MainActor private var reachabilityHandler: RecordingTransferReachabilityHandler?
+    @MainActor private var pendingAcknowledgements: [String: RecordingTransferImportResult] = [:]
     @MainActor public private(set) var receivedTransfers: [RecordingTransferMetadata] = []
 
     public init(
@@ -266,12 +342,23 @@ public final class WatchConnectivityRecordingTransferService: NSObject, Recordin
     }
 
     @MainActor
+    public func setReachabilityHandler(_ handler: RecordingTransferReachabilityHandler?) {
+        reachabilityHandler = handler
+        if let session {
+            publishReachability(for: session)
+        }
+    }
+
+    @MainActor
     public func transfer(recording: Recording) throws -> RecordingTransferReceipt {
         guard let session else {
             throw RecordingTransferError.unsupportedPlatform
         }
-        guard session.activationState != .notActivated else {
+        guard session.activationState == .activated else {
             throw RecordingTransferError.inactiveSession
+        }
+        guard RecordingTransferMetadata(recording: recording).isValid else {
+            throw RecordingTransferError.invalidMetadata
         }
         guard let localAudioPath = recording.localAudioPath else {
             throw RecordingTransferError.missingLocalAudioFile
@@ -282,11 +369,81 @@ public final class WatchConnectivityRecordingTransferService: NSObject, Recordin
             throw RecordingTransferError.missingLocalAudioFile
         }
 
+        let outstandingRecordingIDs = Set(
+            session.outstandingFileTransfers.compactMap { transfer in
+                RecordingTransferMetadata(
+                    watchConnectivityMetadata: transfer.file.metadata ?? [:]
+                )?.recordingID
+            }
+        )
+        guard RecordingTransferQueuePolicy.shouldQueue(
+            recordingID: recording.id,
+            sessionIsActivated: true,
+            outstandingRecordingIDs: outstandingRecordingIDs
+        ) else {
+            IdeaForgeLog.sync.info("Watch recording transfer already queued; duplicate request ignored")
+            return RecordingTransferReceipt(recordingID: recording.id, status: .queuedForTransfer)
+        }
+
         _ = session.transferFile(
             fileURL,
             metadata: RecordingTransferMetadata(recording: recording).watchConnectivityMetadata
         )
         return RecordingTransferReceipt(recordingID: recording.id, status: .queuedForTransfer)
+    }
+
+    @MainActor
+    private func queueAcknowledgement(
+        recordingID: String,
+        result: RecordingTransferImportResult,
+        on session: WCSession
+    ) {
+        guard session.activationState == .activated else {
+            pendingAcknowledgements[recordingID] = result
+            session.activate()
+            IdeaForgeLog.sync.info("Watch import acknowledgement held until connectivity session activates")
+            return
+        }
+        _ = session.transferUserInfo(
+            RecordingTransferImportAcknowledgement(
+                recordingID: recordingID,
+                result: result
+            )
+            .watchConnectivityUserInfo
+        )
+        pendingAcknowledgements.removeValue(forKey: recordingID)
+    }
+
+    @MainActor
+    private func flushPendingAcknowledgements(on session: WCSession) {
+        guard session.activationState == .activated else { return }
+        let acknowledgements = pendingAcknowledgements
+        pendingAcknowledgements.removeAll()
+        for (recordingID, result) in acknowledgements {
+            _ = session.transferUserInfo(
+                RecordingTransferImportAcknowledgement(
+                    recordingID: recordingID,
+                    result: result
+                )
+                .watchConnectivityUserInfo
+            )
+        }
+    }
+
+    @MainActor
+    private func publishReachability(for session: WCSession) {
+        #if os(iOS)
+        let companionIsAvailable = session.isPaired && session.isWatchAppInstalled
+        #else
+        let companionIsAvailable = true
+        #endif
+        reachabilityHandler?(
+            RecordingTransferReachabilityPolicy.isReachable(
+                sessionIsActivated: session.activationState == .activated,
+                companionIsAvailable: companionIsAvailable,
+                sessionIsReachable: session.isReachable
+            )
+        )
     }
 }
 
@@ -295,7 +452,24 @@ extension WatchConnectivityRecordingTransferService: WCSessionDelegate {
         _ session: WCSession,
         activationDidCompleteWith activationState: WCSessionActivationState,
         error: Error?
-    ) {}
+    ) {
+        guard error == nil, activationState == .activated else {
+            if error != nil {
+                IdeaForgeLog.sync.error("Watch connectivity session activation failed")
+            }
+            return
+        }
+        Task { @MainActor [weak self] in
+            self?.flushPendingAcknowledgements(on: session)
+            self?.publishReachability(for: session)
+        }
+    }
+
+    public nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
+        Task { @MainActor [weak self] in
+            self?.publishReachability(for: session)
+        }
+    }
 
     public nonisolated func session(_ session: WCSession, didFinish fileTransfer: WCSessionFileTransfer, error: Error?) {
         guard let metadata = RecordingTransferMetadata(watchConnectivityMetadata: fileTransfer.file.metadata ?? [:]) else {
@@ -326,13 +500,13 @@ extension WatchConnectivityRecordingTransferService: WCSessionDelegate {
             )
         } catch {
             IdeaForgeLog.sync.error("Watch recording transfer staging failed")
-            _ = session.transferUserInfo(
-                RecordingTransferImportAcknowledgement(
+            Task { @MainActor [weak self] in
+                self?.queueAcknowledgement(
                     recordingID: metadata.recordingID,
-                    result: .failed
+                    result: .failed,
+                    on: session
                 )
-                .watchConnectivityUserInfo
-            )
+            }
             return
         }
 
@@ -350,12 +524,10 @@ extension WatchConnectivityRecordingTransferService: WCSessionDelegate {
             if !RecordingTransferFileStager.discardStagedFileAfterImport(stagedFileURL) {
                 IdeaForgeLog.sync.error("Watch recording transfer staging cleanup failed")
             }
-            _ = session.transferUserInfo(
-                RecordingTransferImportAcknowledgement(
-                    recordingID: metadata.recordingID,
-                    result: result
-                )
-                .watchConnectivityUserInfo
+            self.queueAcknowledgement(
+                recordingID: metadata.recordingID,
+                result: result,
+                on: session
             )
         }
     }
@@ -373,9 +545,16 @@ extension WatchConnectivityRecordingTransferService: WCSessionDelegate {
     }
 
     #if os(iOS)
-    public nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
+    public nonisolated func sessionDidBecomeInactive(_ session: WCSession) {
+        Task { @MainActor [weak self] in
+            self?.publishReachability(for: session)
+        }
+    }
 
     public nonisolated func sessionDidDeactivate(_ session: WCSession) {
+        Task { @MainActor [weak self] in
+            self?.publishReachability(for: session)
+        }
         session.activate()
     }
     #endif

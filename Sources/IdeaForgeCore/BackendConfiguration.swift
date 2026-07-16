@@ -238,6 +238,7 @@ public enum BackendRequestHeader {
 
 public enum BackendConfigurationError: Error, Equatable {
     case invalidBaseURL(String)
+    case missingRequiredConfiguration
     case unreadableSettings
     case unwritableSettings
     case keychainUnavailable

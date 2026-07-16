@@ -84,11 +84,12 @@ public enum WorkspaceAutoSyncPolicy {
             )
         }
 
-        guard let lastRemote = state.syncHealth.lastRemoteWorkspaceUpdatedAt else {
+        guard let lastPublishedLocal = state.syncHealth.lastPublishedLocalUpdatedAt
+            ?? state.syncHealth.lastRemoteWorkspaceUpdatedAt else {
             return nil
         }
 
-        guard state.updatedAt > lastRemote else {
+        guard state.updatedAt > lastPublishedLocal else {
             return .idle("Local workspace already has a backend receipt.")
         }
 
@@ -219,8 +220,9 @@ public struct ConfiguredWorkspaceAutoSyncProcessor: Sendable {
                 expectedWorkspaceID: authConfiguration.workspaceID
             )
 
+            let currentState = store.workspaceState()
             let decision = WorkspaceAutoSyncPolicy.decision(
-                for: localState,
+                for: currentState,
                 capabilityDecision: capabilityDecision
             )
             switch decision {
@@ -272,7 +274,7 @@ public struct ConfiguredWorkspaceAutoSyncProcessor: Sendable {
                     transport: syncTransport
                 )
             )
-            let summary = try await engine.pushLocalSnapshot(from: store, syncedAt: syncedAt)
+            let summary = try await engine.synchronize(store: store, syncedAt: syncedAt)
             store.recordSyncActivity(
                 WorkspaceSyncActivityReceipt(
                     source: .backgroundAutoSync,

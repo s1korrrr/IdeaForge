@@ -1164,6 +1164,7 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertEqual(decoded.lastSuccessfulSync, Date(timeIntervalSinceReferenceDate: 2_000))
         XCTAssertEqual(decoded.failingItems, 0)
         XCTAssertNil(decoded.syncConflictStatus)
+        XCTAssertNil(decoded.lastPublishedLocalUpdatedAt)
     }
 
     func testSyncConflictStatusDecodesLegacyPayloadWithoutReviewItems() throws {
@@ -1707,6 +1708,33 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertEqual(try repository.load(), state)
     }
 
+    func testProductionStoreStartsWithEmptyWorkspaceWhenNoStateExists() {
+        let store = IdeaForgeStore.production(repository: InMemoryWorkspaceRepository())
+
+        XCTAssertTrue(store.projects.isEmpty)
+        XCTAssertNil(store.selectedProjectID)
+        XCTAssertEqual(store.workflowTemplates, DefaultWorkflows.templates)
+        XCTAssertEqual(store.updatedAt, .distantPast)
+        XCTAssertNil(store.lastErrorMessage)
+        XCTAssertFalse(store.workspaceLoadFailed)
+    }
+
+    func testProductionStoreSurfacesUnreadableWorkspaceWithoutSeedingSampleData() {
+        let repository = UnreadableWorkspaceRepository()
+        let store = IdeaForgeStore.production(repository: repository)
+
+        XCTAssertTrue(store.projects.isEmpty)
+        XCTAssertNil(store.selectedProjectID)
+        XCTAssertEqual(store.updatedAt, .distantPast)
+        XCTAssertEqual(store.lastErrorMessage, "Workspace data could not be loaded. The original file was left unchanged.")
+        XCTAssertTrue(store.workspaceLoadFailed)
+
+        XCTAssertFalse(store.save(now: Date(timeIntervalSince1970: 2_000)))
+        XCTAssertEqual(store.updatedAt, .distantPast)
+        XCTAssertEqual(repository.saveCallCount, 0)
+        XCTAssertEqual(store.lastErrorMessage, "Workspace data could not be loaded. The original file was left unchanged.")
+    }
+
     func testPrivacyModeChangePersistsToRepository() throws {
         let repository = InMemoryWorkspaceRepository(state: WorkspaceState.seed())
         let store = IdeaForgeStore.production(repository: repository)
@@ -1893,6 +1921,32 @@ final class IdeaForgeCoreTests: XCTestCase {
     }
 
     @MainActor
+    func testProjectDeletionRollsBackWhenWorkspacePersistenceFails() throws {
+        let project = deletionSafetyProject(recordings: [])
+        let state = WorkspaceState(
+            projects: [project],
+            workflowTemplates: DefaultWorkflows.templates,
+            uploadJobs: [],
+            privacyMode: .privateLocal,
+            syncHealth: SyncHealth(
+                watchReachable: false,
+                queuedUploads: 0,
+                lastSuccessfulSync: SampleData.now,
+                failingItems: 0
+            ),
+            selectedProjectID: project.id,
+            updatedAt: SampleData.now
+        )
+        let repository = ThrowingWorkspaceRepository(state: state)
+        let store = IdeaForgeStore(state: state, repository: repository)
+
+        XCTAssertFalse(store.deleteProject(project.id, now: SampleData.now.addingTimeInterval(1)))
+        XCTAssertEqual(store.workspaceState(), state)
+        XCTAssertEqual(try repository.load(), state)
+        XCTAssertEqual(store.lastErrorMessage, "Could not delete the project because the workspace was not saved.")
+    }
+
+    @MainActor
     func testDeleteProjectFailsClosedAndPreservesStateWhenReadinessBlocksDeletion() throws {
         let repository = InMemoryWorkspaceRepository()
         let project = deletionSafetyProject(
@@ -1993,6 +2047,120 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertEqual(saved.syncHealth.queuedUploads, 1)
     }
 
+    @MainActor
+    func testDeleteProjectRemovesOnlyManagedRecordingFilesAfterPersistence() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "IdeaForgeProjectDeletion-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let managedRoot = root.appending(path: "managed", directoryHint: .isDirectory)
+        let outsideRoot = root.appending(path: "outside", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: managedRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outsideRoot, withIntermediateDirectories: true)
+        let managedAudio = managedRoot.appending(path: "managed.m4a")
+        let outsideAudio = outsideRoot.appending(path: "outside.m4a")
+        try Data("managed".utf8).write(to: managedAudio)
+        try Data("outside".utf8).write(to: outsideAudio)
+
+        let managedRecording = deletionRecording(
+            id: "rec_managed_cleanup",
+            localFileStatus: .uploaded,
+            syncStatus: .ready,
+            localAudioPath: managedAudio.path,
+            audioObjectKey: "audio/managed.m4a"
+        )
+        let outsideRecording = deletionRecording(
+            id: "rec_outside_cleanup",
+            localFileStatus: .uploaded,
+            syncStatus: .ready,
+            localAudioPath: outsideAudio.path,
+            audioObjectKey: "audio/outside.m4a"
+        )
+        let project = deletionSafetyProject(recordings: [managedRecording, outsideRecording])
+        let state = WorkspaceState(
+            projects: [project],
+            workflowTemplates: DefaultWorkflows.templates,
+            uploadJobs: [],
+            privacyMode: .privateLocal,
+            syncHealth: SyncHealth(
+                watchReachable: false,
+                queuedUploads: 0,
+                lastSuccessfulSync: SampleData.now,
+                failingItems: 0
+            ),
+            selectedProjectID: project.id,
+            updatedAt: SampleData.now
+        )
+        let repository = InMemoryWorkspaceRepository(state: state)
+        let store = IdeaForgeStore(state: state, repository: repository)
+
+        XCTAssertTrue(
+            store.deleteProject(
+                project.id,
+                now: SampleData.now.addingTimeInterval(1),
+                managedRecordingDirectory: managedRoot
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: managedAudio.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outsideAudio.path))
+    }
+
+    @MainActor
+    func testDeleteProjectKeepsManagedFileReferencedBySurvivingProject() throws {
+        let managedRoot = FileManager.default.temporaryDirectory
+            .appending(path: "IdeaForgeSharedRecording-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: managedRoot) }
+        try FileManager.default.createDirectory(at: managedRoot, withIntermediateDirectories: true)
+        let sharedAudio = managedRoot.appending(path: "shared.m4a")
+        try Data("shared".utf8).write(to: sharedAudio)
+
+        let deletedProject = deletionSafetyProject(recordings: [
+            deletionRecording(
+                id: "rec_shared_deleted",
+                localFileStatus: .uploaded,
+                syncStatus: .ready,
+                localAudioPath: sharedAudio.path,
+                audioObjectKey: "audio/shared-deleted.m4a"
+            )
+        ])
+        let survivingProject = deletionSafetyProject(
+            id: "idea_shared_survivor",
+            title: "Survivor",
+            recordings: [
+                deletionRecording(
+                    id: "rec_shared_survivor",
+                    localFileStatus: .uploaded,
+                    syncStatus: .ready,
+                    localAudioPath: sharedAudio.path,
+                    audioObjectKey: "audio/shared-survivor.m4a"
+                )
+            ]
+        )
+        let state = WorkspaceState(
+            projects: [deletedProject, survivingProject],
+            workflowTemplates: DefaultWorkflows.templates,
+            uploadJobs: [],
+            privacyMode: .privateLocal,
+            syncHealth: SyncHealth(
+                watchReachable: false,
+                queuedUploads: 0,
+                lastSuccessfulSync: SampleData.now,
+                failingItems: 0
+            ),
+            selectedProjectID: deletedProject.id,
+            updatedAt: SampleData.now
+        )
+        let store = IdeaForgeStore(state: state, repository: InMemoryWorkspaceRepository(state: state))
+
+        XCTAssertTrue(
+            store.deleteProject(
+                deletedProject.id,
+                now: SampleData.now.addingTimeInterval(1),
+                managedRecordingDirectory: managedRoot
+            )
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sharedAudio.path))
+    }
+
     func testRecordingTransferMetadataRoundTripsWatchConnectivityPayload() throws {
         let recording = Recording(
             id: "rec_transfer",
@@ -2013,6 +2181,44 @@ final class IdeaForgeCoreTests: XCTestCase {
         )
 
         XCTAssertEqual(decoded, metadata)
+    }
+
+    func testRecordingTransferMetadataRejectsUnsafeBoundaryValues() {
+        let valid = RecordingTransferMetadata(
+            recordingID: "rec_transfer",
+            ideaProjectID: "idea_transfer",
+            sourceDeviceName: "Apple Watch",
+            durationSeconds: 42,
+            languageHint: "en-US",
+            markerOffsets: [4, 18],
+            createdAt: SampleData.now
+        ).watchConnectivityMetadata
+
+        for invalidID in ["", ".", "..", "../escape", "nested/escape", "nested\\escape"] {
+            var payload = valid
+            payload["recordingID"] = invalidID
+            XCTAssertNil(RecordingTransferMetadata(watchConnectivityMetadata: payload))
+        }
+
+        var invalidDuration = valid
+        invalidDuration["durationSeconds"] = -1
+        XCTAssertNil(RecordingTransferMetadata(watchConnectivityMetadata: invalidDuration))
+
+        var invalidMarkers = valid
+        invalidMarkers["markerOffsets"] = [-1, 100]
+        XCTAssertNil(RecordingTransferMetadata(watchConnectivityMetadata: invalidMarkers))
+
+        var invalidTimestamp = valid
+        invalidTimestamp["createdAt"] = Double.nan
+        XCTAssertNil(RecordingTransferMetadata(watchConnectivityMetadata: invalidTimestamp))
+
+        var implausiblyOldTimestamp = valid
+        implausiblyOldTimestamp["createdAt"] = Date(timeIntervalSince1970: 1).timeIntervalSince1970
+        XCTAssertNil(RecordingTransferMetadata(watchConnectivityMetadata: implausiblyOldTimestamp))
+
+        var implausiblyFutureTimestamp = valid
+        implausiblyFutureTimestamp["createdAt"] = Date().addingTimeInterval(2 * 60 * 60).timeIntervalSince1970
+        XCTAssertNil(RecordingTransferMetadata(watchConnectivityMetadata: implausiblyFutureTimestamp))
     }
 
     func testRecordingTransferImportAcknowledgementRoundTripsQueuedMessage() throws {
@@ -2043,6 +2249,61 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertEqual(RecordingTransferCompletionPolicy.transportCompletion(delivered: false), false)
         XCTAssertEqual(RecordingTransferCompletionPolicy.importCompletion(for: .imported), true)
         XCTAssertEqual(RecordingTransferCompletionPolicy.importCompletion(for: .failed), false)
+    }
+
+    func testRecordingTransferQueueRequiresActivatedSessionAndNoOutstandingDuplicate() {
+        XCTAssertFalse(
+            RecordingTransferQueuePolicy.shouldQueue(
+                recordingID: "rec_watch",
+                sessionIsActivated: false,
+                outstandingRecordingIDs: []
+            )
+        )
+        XCTAssertFalse(
+            RecordingTransferQueuePolicy.shouldQueue(
+                recordingID: "rec_watch",
+                sessionIsActivated: true,
+                outstandingRecordingIDs: ["rec_watch"]
+            )
+        )
+        XCTAssertTrue(
+            RecordingTransferQueuePolicy.shouldQueue(
+                recordingID: "rec_watch",
+                sessionIsActivated: true,
+                outstandingRecordingIDs: []
+            )
+        )
+    }
+
+    func testRecordingTransferReachabilityRequiresActivationCompanionAndLiveReachability() {
+        XCTAssertTrue(
+            RecordingTransferReachabilityPolicy.isReachable(
+                sessionIsActivated: true,
+                companionIsAvailable: true,
+                sessionIsReachable: true
+            )
+        )
+        XCTAssertFalse(
+            RecordingTransferReachabilityPolicy.isReachable(
+                sessionIsActivated: false,
+                companionIsAvailable: true,
+                sessionIsReachable: true
+            )
+        )
+        XCTAssertFalse(
+            RecordingTransferReachabilityPolicy.isReachable(
+                sessionIsActivated: true,
+                companionIsAvailable: false,
+                sessionIsReachable: true
+            )
+        )
+        XCTAssertFalse(
+            RecordingTransferReachabilityPolicy.isReachable(
+                sessionIsActivated: true,
+                companionIsAvailable: true,
+                sessionIsReachable: false
+            )
+        )
     }
 
     func testStagedWatchConnectivityFileIsDiscardedAfterImportAttempt() throws {
@@ -2151,6 +2412,33 @@ final class IdeaForgeCoreTests: XCTestCase {
 
         let saved = try XCTUnwrap(try repository.load())
         XCTAssertEqual(saved.projects.first?.recordings.first?.syncStatus, .failed)
+    }
+
+    @MainActor
+    func testWatchTransferReceiptRollsBackWhenWorkspacePersistenceFails() throws {
+        var originalState = WorkspaceState.seed()
+        let recordingID = try XCTUnwrap(originalState.projects.first?.recordings.first?.id)
+        originalState.projects[0].recordings[0].syncStatus = .pending
+        let repository = ThrowingWorkspaceRepository(state: originalState)
+        let store = IdeaForgeStore(state: originalState, repository: repository)
+
+        XCTAssertFalse(
+            store.markRecordingTransferredToIPhone(
+                recordingID: recordingID,
+                now: SampleData.now
+            )
+        )
+        XCTAssertEqual(store.workspaceState(), originalState)
+        XCTAssertEqual(store.lastErrorMessage, "Watch transfer receipt could not be saved.")
+
+        XCTAssertFalse(
+            store.markRecordingWatchTransferFailed(
+                recordingID: recordingID,
+                now: SampleData.now
+            )
+        )
+        XCTAssertEqual(store.workspaceState(), originalState)
+        XCTAssertEqual(store.lastErrorMessage, "Watch transfer failure could not be saved.")
     }
 
     @MainActor
@@ -2320,6 +2608,149 @@ final class IdeaForgeCoreTests: XCTestCase {
     }
 
     @MainActor
+    func testTransferredWatchFileImportFailsClosedWhenWorkspaceCannotBePersisted() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "IdeaForgeTransferPersistenceTests-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let sourceURL = root.appending(path: "watch-source.m4a")
+        try Data("watch audio".utf8).write(to: sourceURL)
+
+        let originalState = WorkspaceState(
+            projects: [],
+            workflowTemplates: DefaultWorkflows.templates,
+            uploadJobs: [],
+            privacyMode: .privateLocal,
+            syncHealth: SyncHealth(
+                watchReachable: true,
+                queuedUploads: 0,
+                lastSuccessfulSync: SampleData.now,
+                failingItems: 0
+            ),
+            selectedProjectID: nil,
+            updatedAt: SampleData.now
+        )
+        let repository = ThrowingWorkspaceRepository(state: originalState)
+        let store = IdeaForgeStore(state: originalState, repository: repository)
+        let metadata = RecordingTransferMetadata(
+            recordingID: "rec_watch_import_persistence_failure",
+            ideaProjectID: "idea_watch_import_persistence_failure",
+            sourceDeviceName: "Apple Watch",
+            durationSeconds: 33,
+            languageHint: "en-US",
+            markerOffsets: [5],
+            createdAt: SampleData.now
+        )
+        let inbox = root.appending(path: "inbox", directoryHint: .isDirectory)
+        let importer = TransferredRecordingImporter(inboxDirectory: inbox)
+
+        do {
+            _ = try await importer.importFile(sourceURL: sourceURL, metadata: metadata, into: store)
+            XCTFail("Expected the import to fail when workspace persistence fails.")
+        } catch {
+            XCTAssertEqual(error as? TransferredRecordingImportError, .copyFailed)
+        }
+
+        XCTAssertEqual(store.workspaceState(), originalState)
+        XCTAssertEqual(try repository.load(), originalState)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: inbox.appending(path: "rec_watch_import_persistence_failure.m4a").path))
+    }
+
+    @MainActor
+    func testWatchCaptureFailsClosedWhenWorkspaceCannotBePersisted() async throws {
+        let originalState = WorkspaceState(
+            projects: [],
+            workflowTemplates: DefaultWorkflows.templates,
+            uploadJobs: [],
+            privacyMode: .privateLocal,
+            syncHealth: SyncHealth(
+                watchReachable: false,
+                queuedUploads: 0,
+                lastSuccessfulSync: SampleData.now,
+                failingItems: 0
+            ),
+            selectedProjectID: nil,
+            updatedAt: SampleData.now
+        )
+        let repository = ThrowingWorkspaceRepository(state: originalState)
+        let store = IdeaForgeStore(state: originalState, repository: repository)
+        let draft = RecordingDraft(
+            projectTitle: "Durable Watch capture",
+            tag: .appIdea,
+            source: .watch,
+            durationSeconds: 12,
+            transcriptHint: "Keep the recovery checkpoint if this cannot be saved.",
+            localAudioPath: "recordings/watch-durable.m4a"
+        )
+
+        let captured = await store.capture(draft, services: .local)
+
+        XCTAssertNil(captured)
+        XCTAssertEqual(store.workspaceState(), originalState)
+        XCTAssertEqual(try repository.load(), originalState)
+        XCTAssertEqual(store.lastErrorMessage, "Capture could not be saved.")
+    }
+
+    @MainActor
+    func testWatchAppendFailsClosedWhenWorkspaceCannotBePersisted() async throws {
+        var originalState = WorkspaceState.seed()
+        originalState.uploadJobs = []
+        let projectID = try XCTUnwrap(originalState.projects.first?.id)
+        let repository = ThrowingWorkspaceRepository(state: originalState)
+        let store = IdeaForgeStore(state: originalState, repository: repository)
+        let draft = RecordingDraft(
+            projectTitle: "Durable Watch append",
+            tag: .appIdea,
+            source: .watch,
+            durationSeconds: 14,
+            transcriptHint: "This append must not exist only in memory.",
+            localAudioPath: "recordings/watch-append-durable.m4a"
+        )
+
+        let appended = await store.appendWatchRecording(draft, to: projectID, services: .local)
+
+        XCTAssertNil(appended)
+        XCTAssertEqual(store.workspaceState(), originalState)
+        XCTAssertEqual(try repository.load(), originalState)
+        XCTAssertEqual(store.lastErrorMessage, "Watch append could not be saved.")
+    }
+
+    @MainActor
+    func testWatchAppendRevalidatesTargetAfterAsyncQueueing() async throws {
+        let initialState = WorkspaceState.seed()
+        let repository = InMemoryWorkspaceRepository(state: initialState)
+        let store = IdeaForgeStore(state: initialState, repository: repository)
+        let targetID = try XCTUnwrap(store.projects.first?.id)
+        let survivorID = try XCTUnwrap(store.projects.last?.id)
+        let services = IdeaForgeServices(
+            transcription: LocalTranscriptionService(),
+            workflow: LocalWorkflowExecutionService(),
+            syncQueue: MutatingSyncQueueService {
+                store.projects.removeAll { $0.id == targetID }
+                store.selectedProjectID = survivorID
+                _ = store.save()
+            },
+            export: LocalExportService()
+        )
+        let draft = RecordingDraft(
+            projectTitle: "Removed target",
+            tag: .appIdea,
+            source: .watch,
+            durationSeconds: 10,
+            transcriptHint: "Must not move to the survivor.",
+            localAudioPath: "recordings/reentrant.m4a",
+            recordingID: "rec_reentrant_watch_append"
+        )
+
+        let appended = await store.appendWatchRecording(draft, to: targetID, services: services)
+
+        XCTAssertNil(appended)
+        XCTAssertEqual(store.projects.map(\.id), [survivorID])
+        XCTAssertFalse(store.projects.flatMap(\.recordings).contains { $0.id == "rec_reentrant_watch_append" })
+        XCTAssertEqual(try repository.load()?.projects.map(\.id), [survivorID])
+    }
+
+    @MainActor
     func testTransferredWatchFileReplayIsIdempotentAndDoesNotOverwriteInboxFile() async throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "IdeaForgeTransferReplayTests-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -2381,6 +2812,49 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertEqual(saved.projects.first?.recordings.map(\.id), ["rec_watch_replay"])
         XCTAssertEqual(saved.uploadJobs.map(\.recordingID), ["rec_watch_replay"])
         XCTAssertEqual(saved.syncHealth.queuedUploads, 1)
+    }
+
+    @MainActor
+    func testTransferredWatchReplayRepairsMissingDurableAudio() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "IdeaForgeTransferRepairTests-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let firstURL = root.appending(path: "first.m4a")
+        let replayURL = root.appending(path: "replay.m4a")
+        try Data("first audio".utf8).write(to: firstURL)
+        try Data("repaired audio".utf8).write(to: replayURL)
+        let repository = InMemoryWorkspaceRepository()
+        let store = IdeaForgeStore(
+            projects: [],
+            workflowTemplates: DefaultWorkflows.templates,
+            privacyMode: .privateLocal,
+            syncHealth: SyncHealth(watchReachable: true, queuedUploads: 0, lastSuccessfulSync: SampleData.now, failingItems: 0),
+            repository: repository
+        )
+        let metadata = RecordingTransferMetadata(
+            recordingID: "rec_watch_repair",
+            ideaProjectID: "idea_watch_repair",
+            sourceDeviceName: "Apple Watch",
+            durationSeconds: 12,
+            languageHint: "en-US",
+            markerOffsets: [],
+            createdAt: SampleData.now
+        )
+        let importer = TransferredRecordingImporter(inboxDirectory: root.appending(path: "inbox", directoryHint: .isDirectory))
+        let firstProject = try await importer.importFile(sourceURL: firstURL, metadata: metadata, into: store)
+        let importedPath = try XCTUnwrap(firstProject.recordings.first?.localAudioPath)
+        try FileManager.default.removeItem(atPath: importedPath)
+
+        let repairedProject = try await importer.importFile(sourceURL: replayURL, metadata: metadata, into: store)
+
+        let repairedRecording = try XCTUnwrap(repairedProject.recordings.first)
+        XCTAssertEqual(repairedRecording.localFileStatus, .available)
+        XCTAssertEqual(repairedRecording.syncStatus, .transferredToIPhone)
+        let repairedPath = try XCTUnwrap(repairedRecording.localAudioPath)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: repairedPath)), Data("repaired audio".utf8))
+        XCTAssertEqual(store.uploadJobs.first?.status, .queued)
+        XCTAssertEqual(store.uploadJobs.first?.attemptCount, 0)
     }
 
     @MainActor
@@ -2498,6 +2972,30 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertEqual(project.transcript, originalTranscript)
         XCTAssertEqual(store.uploadJobs.map(\.recordingID), ["rec_attach_replay"])
         XCTAssertEqual(store.syncHealth.queuedUploads, 1)
+    }
+
+    @MainActor
+    func testAttachNewTransferredRecordingPreservesExistingProjectTranscript() throws {
+        let state = WorkspaceState.seed()
+        let projectID = try XCTUnwrap(state.projects.first?.id)
+        let originalTranscript = try XCTUnwrap(state.projects.first?.transcript)
+        let store = IdeaForgeStore(state: state, repository: InMemoryWorkspaceRepository(state: state))
+        let recording = Recording(
+            id: "rec_late_watch_transfer",
+            ideaProjectID: projectID,
+            deviceName: "Apple Watch",
+            durationSeconds: 20,
+            localFileStatus: .available,
+            syncStatus: .transferredToIPhone,
+            localAudioPath: "recordings/rec_late_watch_transfer.m4a",
+            languageHint: "en-US",
+            createdAt: SampleData.now,
+            markerOffsets: []
+        )
+        let placeholder = Transcript(cleanText: "Voice idea transferred from Apple Watch.", segments: [], unclearFragments: [])
+
+        XCTAssertTrue(store.attach(recording: recording, to: projectID, transcript: placeholder))
+        XCTAssertEqual(store.projects.first?.transcript, originalTranscript)
     }
 
     func testUploadQueuePolicySchedulesBoundedRetry() {
@@ -2830,6 +3328,108 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertEqual(store.projects.flatMap(\.recordings).first?.localAudioPath, fixture.localAudioPath)
     }
 
+    @MainActor
+    func testUploadSuccessRollsBackWhenWorkspacePersistenceFails() throws {
+        let fixture = try FailedUploadFixture.make(source: .iphone)
+        defer { try? fixture.fileManager.removeItem(at: fixture.directory) }
+        let repository = ThrowingWorkspaceRepository(state: fixture.state)
+        let store = IdeaForgeStore(state: fixture.state, repository: repository)
+
+        XCTAssertFalse(
+            store.markUploadSucceeded(
+                recordingID: fixture.recordingID,
+                objectKey: "audio/test/object.m4a",
+                now: fixture.now
+            )
+        )
+        XCTAssertEqual(store.workspaceState(), fixture.state)
+        XCTAssertEqual(try repository.load(), fixture.state)
+        XCTAssertEqual(store.lastErrorMessage, "Upload completion could not be saved.")
+    }
+
+    @MainActor
+    func testUploadStartRollsBackWhenWorkspacePersistenceFails() throws {
+        let fixture = try FailedUploadFixture.make(source: .iphone)
+        defer { try? fixture.fileManager.removeItem(at: fixture.directory) }
+        let repository = ThrowingWorkspaceRepository(state: fixture.state)
+        let store = IdeaForgeStore(state: fixture.state, repository: repository)
+
+        store.markUploadStarted(recordingID: fixture.recordingID, now: fixture.now)
+
+        XCTAssertEqual(store.workspaceState(), fixture.state)
+        XCTAssertEqual(try repository.load(), fixture.state)
+        XCTAssertEqual(store.lastErrorMessage, "Upload start could not be saved.")
+    }
+
+    @MainActor
+    func testInterruptedUploadRecoveryRollsBackWhenWorkspacePersistenceFails() throws {
+        let fixture = try FailedUploadFixture.make(source: .iphone)
+        defer { try? fixture.fileManager.removeItem(at: fixture.directory) }
+        var state = fixture.state
+        let startedAt = fixture.now.addingTimeInterval(-UploadQueuePolicy.interruptedUploadTimeout - 1)
+        state.uploadJobs[0] = UploadQueuePolicy.markUploading(state.uploadJobs[0], now: startedAt)
+        let repository = ThrowingWorkspaceRepository(state: state)
+        let store = IdeaForgeStore(state: state, repository: repository)
+
+        XCTAssertEqual(store.recoverInterruptedUploads(now: fixture.now), 0)
+
+        XCTAssertEqual(store.workspaceState(), state)
+        XCTAssertEqual(try repository.load(), state)
+        XCTAssertEqual(store.lastErrorMessage, "Interrupted upload recovery could not be saved.")
+    }
+
+    @MainActor
+    func testUploadFailureRollsBackWhenWorkspacePersistenceFails() throws {
+        let fixture = try FailedUploadFixture.make(source: .iphone)
+        defer { try? fixture.fileManager.removeItem(at: fixture.directory) }
+        let repository = ThrowingWorkspaceRepository(state: fixture.state)
+        let store = IdeaForgeStore(state: fixture.state, repository: repository)
+
+        XCTAssertFalse(
+            store.markUploadFailed(
+                recordingID: fixture.recordingID,
+                message: "offline",
+                category: .connectivity,
+                now: fixture.now
+            )
+        )
+        XCTAssertEqual(store.workspaceState(), fixture.state)
+        XCTAssertEqual(try repository.load(), fixture.state)
+        XCTAssertEqual(store.lastErrorMessage, "Upload failure could not be saved.")
+    }
+
+    @MainActor
+    func testHistoricalUploadCompletionDoesNotMoveWorkspaceClockBackward() throws {
+        let fixture = try FailedUploadFixture.make(source: .iphone)
+        defer { try? fixture.fileManager.removeItem(at: fixture.directory) }
+        var state = fixture.state
+        let newerEditAt = Date(timeIntervalSince1970: 9_000)
+        state.updatedAt = newerEditAt
+        let repository = InMemoryWorkspaceRepository(state: state)
+        let store = IdeaForgeStore(state: state, repository: repository)
+
+        XCTAssertTrue(
+            store.markUploadSucceeded(
+                recordingID: fixture.recordingID,
+                objectKey: "audio/test/object.m4a",
+                now: Date(timeIntervalSince1970: 8_000)
+            )
+        )
+
+        XCTAssertEqual(store.updatedAt, newerEditAt)
+        XCTAssertEqual(try repository.load()?.updatedAt, newerEditAt)
+    }
+
+    @MainActor
+    func testWatchTransferReceiptRejectsUnknownRecordingID() {
+        let state = WorkspaceState.seed()
+        let store = IdeaForgeStore(state: state, repository: InMemoryWorkspaceRepository(state: state))
+
+        XCTAssertFalse(store.markRecordingTransferredToIPhone(recordingID: "rec_unknown", now: SampleData.now))
+        XCTAssertFalse(store.markRecordingWatchTransferFailed(recordingID: "rec_unknown", now: SampleData.now))
+        XCTAssertEqual(store.workspaceState(), state)
+    }
+
     func testUploadQueuePolicyRecoversInterruptedInFlightUpload() {
         let startedAt = Date(timeIntervalSince1970: 100)
         let recoveredAt = startedAt.addingTimeInterval(UploadQueuePolicy.interruptedUploadTimeout + 1)
@@ -3024,6 +3624,38 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertEqual(captured.request?.value(forHTTPHeaderField: "X-IdeaForge-Attempt"), "2")
         XCTAssertEqual(captured.sourceURL, sourceURL)
         XCTAssertEqual(captured.body, audioData)
+    }
+
+    func testBackgroundUploadCompletionRecordRestoresSuccessfulReceiptAfterRelaunch() throws {
+        let record = BackgroundUploadCompletionRecord(
+            uploadJobID: "upload_rec_background",
+            recordingID: "rec_background",
+            responseData: try JSONSerialization.data(withJSONObject: ["objectKey": "audio/idea/rec_background.m4a"]),
+            statusCode: 200,
+            errorDescription: nil,
+            completedAt: SampleData.now
+        )
+
+        XCTAssertEqual(
+            try BackgroundUploadCompletionPolicy.receipt(from: record),
+            UploadReceipt(
+                recordingID: "rec_background",
+                objectKey: "audio/idea/rec_background.m4a"
+            )
+        )
+    }
+
+    func testBackgroundUploadCompletionRecordFailsClosedForUnsuccessfulResponse() {
+        let record = BackgroundUploadCompletionRecord(
+            uploadJobID: "upload_rec_background",
+            recordingID: "rec_background",
+            responseData: Data(),
+            statusCode: 503,
+            errorDescription: nil,
+            completedAt: SampleData.now
+        )
+
+        XCTAssertThrowsError(try BackgroundUploadCompletionPolicy.receipt(from: record))
     }
 
     func testAudioUploadClientFactoryFallsBackToLocalClientWithoutBackendToken() {
@@ -3936,6 +4568,8 @@ final class IdeaForgeCoreTests: XCTestCase {
         var localState = WorkspaceState.seed()
         localState.updatedAt = Date(timeIntervalSince1970: 2_000)
         let baseRemoteUpdatedAt = Date(timeIntervalSince1970: 1_500)
+        localState.syncHealth.lastRemoteWorkspaceUpdatedAt = baseRemoteUpdatedAt
+        localState.syncHealth.lastPublishedLocalUpdatedAt = Date(timeIntervalSince1970: 1_400)
         let receipt = WorkspaceSyncPushReceipt(
             workspaceID: "workspace_alpha",
             acceptedUpdatedAt: localState.updatedAt
@@ -3977,6 +4611,9 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertEqual(capturedRequest?.url?.path, "/workspace/snapshot")
         XCTAssertEqual(decodedBody.updatedAt, localState.updatedAt)
         XCTAssertEqual(decodedBody.projects.map(\.id), localState.projects.map(\.id))
+        XCTAssertNil(decodedBody.syncHealth.lastRemoteWorkspaceUpdatedAt)
+        XCTAssertNil(decodedBody.syncHealth.lastPublishedLocalUpdatedAt)
+        XCTAssertEqual(decodedBody.syncHealth.lastSuccessfulSync, .distantPast)
     }
 
     func testBackendAccountUsageClientRequestsScopedSummaryAndDecodesEntitlements() async throws {
@@ -4283,6 +4920,16 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertTrue(trigger.shouldProcessUploads)
         XCTAssertTrue(trigger.shouldPublishLocalSnapshot)
         XCTAssertTrue(trigger.shouldRefreshWorkspace)
+    }
+
+    func testRemoteNotificationRegistrationStillRegistersForSilentPushWhenAlertsAreDenied() {
+        let deniedPlan = RemoteNotificationRegistrationPolicy.plan(for: .denied)
+        XCTAssertFalse(deniedPlan.shouldRequestAlertAuthorization)
+        XCTAssertTrue(deniedPlan.shouldRegisterForRemoteNotifications)
+
+        let undeterminedPlan = RemoteNotificationRegistrationPolicy.plan(for: .notDetermined)
+        XCTAssertTrue(undeterminedPlan.shouldRequestAlertAuthorization)
+        XCTAssertTrue(undeterminedPlan.shouldRegisterForRemoteNotifications)
     }
 
     func testRemotePushNotificationParserRejectsVisibleNotificationPayload() throws {
@@ -4779,6 +5426,17 @@ final class IdeaForgeCoreTests: XCTestCase {
             .isPublishable
         )
 
+        state.syncHealth.lastPublishedLocalUpdatedAt = remoteUpdatedAt
+        state.syncHealth.lastRemoteWorkspaceUpdatedAt = Date(timeIntervalSince1970: 3_000)
+        XCTAssertTrue(
+            WorkspaceAutoSyncPolicy.decision(
+                for: state,
+                capabilityDecision: allowedDecision
+            )
+            .isPublishable,
+            "A server-assigned revision must not hide a local edit made after the published snapshot was captured."
+        )
+
         state.updatedAt = remoteUpdatedAt
         XCTAssertEqual(
             WorkspaceAutoSyncPolicy.decision(
@@ -4939,8 +5597,11 @@ final class IdeaForgeCoreTests: XCTestCase {
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
+        var remoteState = state
+        remoteState.updatedAt = remoteUpdatedAt
         let transport = SequencedHTTPRequestTransport(responses: [
             HTTPTestResponse(data: try encoder.encode(session), statusCode: 200),
+            HTTPTestResponse(data: try encoder.encode(remoteState), statusCode: 200),
             HTTPTestResponse(data: try encoder.encode(receipt), statusCode: 200)
         ])
         let manager = BackendConfigurationManager(
@@ -4968,10 +5629,11 @@ final class IdeaForgeCoreTests: XCTestCase {
         }
         XCTAssertTrue(summary.pushedLocalSnapshot)
         XCTAssertEqual(summary.acceptedLocalUpdatedAt, localUpdatedAt)
-        XCTAssertEqual(requests.map(\.httpMethod), ["GET", "PUT"])
+        XCTAssertEqual(requests.map(\.httpMethod), ["GET", "GET", "PUT"])
         XCTAssertEqual(requests.first?.url?.absoluteString, "https://api.example.test/v1/auth/session")
         XCTAssertEqual(requests.first?.value(forHTTPHeaderField: "Authorization"), "Bearer sync-token")
         XCTAssertEqual(requests.first?.value(forHTTPHeaderField: "X-IdeaForge-Workspace-ID"), "workspace_alpha")
+        XCTAssertEqual(requests[1].url?.absoluteString, "https://api.example.test/v1/workspace/snapshot?since=1970-01-01T00:16:40Z")
         XCTAssertEqual(requests.last?.url?.absoluteString, "https://api.example.test/v1/workspace/snapshot")
         XCTAssertEqual(requests.last?.value(forHTTPHeaderField: "Authorization"), "Bearer sync-token")
         XCTAssertEqual(requests.last?.value(forHTTPHeaderField: "X-IdeaForge-Workspace-ID"), "workspace_alpha")
@@ -5246,6 +5908,7 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertTrue(summary.appliedRemoteSnapshot)
         XCTAssertEqual(store.selectedProject?.title, "Remote Idea")
         XCTAssertEqual(store.updatedAt, remoteUpdatedAt)
+        XCTAssertEqual(store.syncHealth.lastRemoteWorkspaceUpdatedAt, remoteUpdatedAt)
         XCTAssertEqual(store.syncHealth.lastSuccessfulSync, Date(timeIntervalSince1970: 3_000))
         XCTAssertNil(store.syncHealth.syncConflictStatus)
 
@@ -5269,7 +5932,116 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertEqual(store.selectedProject?.title, "Remote Idea")
         XCTAssertEqual(store.updatedAt, remoteUpdatedAt)
         XCTAssertEqual(store.syncHealth.lastSuccessfulSync, Date(timeIntervalSince1970: 4_000))
-        XCTAssertEqual(store.syncHealth.lastRemoteWorkspaceUpdatedAt, olderState.updatedAt)
+        XCTAssertEqual(store.syncHealth.lastRemoteWorkspaceUpdatedAt, remoteUpdatedAt)
+    }
+
+    @MainActor
+    func testWorkspaceSyncEngineInitialPullHydratesEmptyWorkspaceEvenWhenLocalClockIsNewer() async throws {
+        let localUpdatedAt = Date(timeIntervalSince1970: 4_000)
+        let remoteUpdatedAt = Date(timeIntervalSince1970: 2_000)
+        let repository = InMemoryWorkspaceRepository()
+        let localState = WorkspaceState(
+            projects: [],
+            workflowTemplates: DefaultWorkflows.templates,
+            uploadJobs: [],
+            privacyMode: .privateLocal,
+            syncHealth: SyncHealth(
+                watchReachable: false,
+                queuedUploads: 0,
+                lastSuccessfulSync: .distantPast,
+                failingItems: 0
+            ),
+            selectedProjectID: nil,
+            updatedAt: localUpdatedAt
+        )
+        let store = IdeaForgeStore(state: localState, repository: repository)
+        var remoteState = WorkspaceState.seed()
+        remoteState.updatedAt = remoteUpdatedAt
+        remoteState.syncHealth.lastRemoteWorkspaceUpdatedAt = remoteUpdatedAt
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let engine = WorkspaceSyncEngine(
+            client: BackendWorkspaceSyncClient(
+                configuration: BackendSyncConfiguration(
+                    baseURL: URL(string: "https://api.example.test")!,
+                    bearerToken: "sync-token",
+                    workspaceID: "workspace_alpha"
+                ),
+                transport: CapturingHTTPRequestTransport(
+                    responseData: try encoder.encode(remoteState),
+                    statusCode: 200
+                )
+            )
+        )
+
+        let summary = try await engine.pullLatest(into: store, syncedAt: Date(timeIntervalSince1970: 5_000))
+        let expectedRemoteState = WorkspaceSyncPayloadPolicy.inboundState(
+            from: remoteState,
+            preservingDeviceLocalState: localState
+        )
+
+        XCTAssertTrue(summary.appliedRemoteSnapshot)
+        XCTAssertEqual(store.projects, expectedRemoteState.projects)
+        XCTAssertEqual(store.updatedAt, remoteUpdatedAt)
+        XCTAssertEqual(store.syncHealth.lastRemoteWorkspaceUpdatedAt, remoteUpdatedAt)
+    }
+
+    @MainActor
+    func testRemoteWorkspaceApplyRollsBackWhenPersistenceFails() throws {
+        var localState = WorkspaceState.fresh()
+        localState.updatedAt = Date(timeIntervalSince1970: 1_000)
+        let repository = ThrowingWorkspaceRepository(state: localState)
+        let store = IdeaForgeStore(state: localState, repository: repository)
+        var remoteState = WorkspaceState.seed()
+        remoteState.updatedAt = Date(timeIntervalSince1970: 2_000)
+
+        XCTAssertThrowsError(
+            try store.applyRemoteWorkspaceSnapshot(
+                remoteState,
+                syncedAt: Date(timeIntervalSince1970: 3_000)
+            )
+        )
+        XCTAssertEqual(store.workspaceState(), localState)
+        XCTAssertEqual(try repository.load(), localState)
+        XCTAssertEqual(store.lastErrorMessage, "Remote workspace could not be saved.")
+    }
+
+    @MainActor
+    func testRemoteWorkspaceApplyPreservesDeviceLocalAudioAndUploadQueue() throws {
+        var localState = WorkspaceState.seed()
+        localState.updatedAt = Date(timeIntervalSince1970: 1_000)
+        localState.syncHealth.lastRemoteWorkspaceUpdatedAt = localState.updatedAt
+        localState.syncHealth.lastPublishedLocalUpdatedAt = localState.updatedAt
+        for index in localState.projects.indices {
+            localState.projects[index].updatedAt = localState.updatedAt
+        }
+        let expectedLocalPaths = Dictionary(
+            uniqueKeysWithValues: localState.projects
+                .flatMap(\.recordings)
+                .map { ($0.id, $0.localAudioPath) }
+        )
+        let expectedUploadJobs = localState.uploadJobs
+        var remoteState = WorkspaceSyncPayloadPolicy.outboundState(from: localState)
+        remoteState.updatedAt = Date(timeIntervalSince1970: 2_000)
+        remoteState.projects[0].title = "Remote title edit"
+        remoteState.projects[0].updatedAt = remoteState.updatedAt
+        let store = IdeaForgeStore(
+            state: localState,
+            repository: InMemoryWorkspaceRepository(state: localState)
+        )
+
+        XCTAssertTrue(
+            try store.applyRemoteWorkspaceSnapshot(
+                remoteState,
+                syncedAt: Date(timeIntervalSince1970: 3_000)
+            )
+        )
+
+        XCTAssertEqual(store.projects[0].title, "Remote title edit")
+        XCTAssertEqual(store.uploadJobs, expectedUploadJobs)
+        for recording in store.projects.flatMap(\.recordings) {
+            XCTAssertEqual(recording.localAudioPath, expectedLocalPaths[recording.id] ?? nil)
+        }
     }
 
     @MainActor
@@ -5277,13 +6049,14 @@ final class IdeaForgeCoreTests: XCTestCase {
         let localUpdatedAt = Date(timeIntervalSince1970: 2_000)
         let lastRemoteUpdatedAt = Date(timeIntervalSince1970: 1_000)
         let syncedAt = Date(timeIntervalSince1970: 2_100)
+        let serverAcceptedAt = Date(timeIntervalSince1970: 2_500)
         let repository = InMemoryWorkspaceRepository()
         let store = IdeaForgeStore(state: WorkspaceState.seed(), repository: repository)
         store.syncHealth.lastRemoteWorkspaceUpdatedAt = lastRemoteUpdatedAt
         store.save(now: localUpdatedAt)
         let receipt = WorkspaceSyncPushReceipt(
             workspaceID: "workspace_alpha",
-            acceptedUpdatedAt: localUpdatedAt
+            acceptedUpdatedAt: serverAcceptedAt
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -5305,16 +6078,396 @@ final class IdeaForgeCoreTests: XCTestCase {
         let summary = try await engine.pushLocalSnapshot(from: store, syncedAt: syncedAt)
         let saved = try XCTUnwrap(try repository.load())
         let capturedRequest = await transport.capturedRequest()
+        let publishedBody = try XCTUnwrap(capturedRequest?.httpBody)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let publishedState = try decoder.decode(WorkspaceState.self, from: publishedBody)
 
         XCTAssertTrue(summary.pushedLocalSnapshot)
         XCTAssertFalse(summary.fetched)
         XCTAssertEqual(summary.acceptedLocalUpdatedAt, localUpdatedAt)
         XCTAssertEqual(store.updatedAt, localUpdatedAt)
         XCTAssertEqual(store.syncHealth.lastSuccessfulSync, syncedAt)
-        XCTAssertEqual(store.syncHealth.lastRemoteWorkspaceUpdatedAt, localUpdatedAt)
+        XCTAssertEqual(store.syncHealth.lastRemoteWorkspaceUpdatedAt, serverAcceptedAt)
+        XCTAssertEqual(store.syncHealth.lastPublishedLocalUpdatedAt, localUpdatedAt)
         XCTAssertEqual(saved.syncHealth.lastSuccessfulSync, syncedAt)
-        XCTAssertEqual(saved.syncHealth.lastRemoteWorkspaceUpdatedAt, localUpdatedAt)
+        XCTAssertEqual(saved.syncHealth.lastRemoteWorkspaceUpdatedAt, serverAcceptedAt)
+        XCTAssertEqual(saved.syncHealth.lastPublishedLocalUpdatedAt, localUpdatedAt)
         XCTAssertEqual(capturedRequest?.value(forHTTPHeaderField: "X-IdeaForge-Base-Remote-Updated-At"), "1970-01-01T00:16:40Z")
+        XCTAssertTrue(publishedState.uploadJobs.isEmpty)
+        XCTAssertTrue(
+            publishedState.projects
+                .flatMap(\.recordings)
+                .allSatisfy { $0.localAudioPath == nil }
+        )
+    }
+
+    @MainActor
+    func testWorkspaceSyncEngineDoesNotReportPublishedWhenReceiptCannotBePersisted() async throws {
+        var localState = WorkspaceState.seed()
+        localState.updatedAt = Date(timeIntervalSince1970: 2_000)
+        localState.syncHealth.lastRemoteWorkspaceUpdatedAt = Date(timeIntervalSince1970: 1_000)
+        let repository = ThrowingWorkspaceRepository(state: localState)
+        let store = IdeaForgeStore(state: localState, repository: repository)
+        let receipt = WorkspaceSyncPushReceipt(
+            workspaceID: "workspace_alpha",
+            acceptedUpdatedAt: localState.updatedAt
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let engine = WorkspaceSyncEngine(
+            client: BackendWorkspaceSyncClient(
+                configuration: BackendSyncConfiguration(
+                    baseURL: URL(string: "https://api.example.test")!,
+                    bearerToken: "sync-token",
+                    workspaceID: "workspace_alpha"
+                ),
+                transport: CapturingHTTPRequestTransport(
+                    responseData: try encoder.encode(receipt),
+                    statusCode: 200
+                )
+            )
+        )
+
+        do {
+            _ = try await engine.pushLocalSnapshot(
+                from: store,
+                syncedAt: Date(timeIntervalSince1970: 3_000)
+            )
+            XCTFail("Expected a failed receipt persistence to fail the sync operation.")
+        } catch {
+            XCTAssertEqual(error as? WorkspaceRepositoryError, .unwritableState)
+        }
+        XCTAssertEqual(store.workspaceState(), localState)
+        XCTAssertEqual(try repository.load(), localState)
+        XCTAssertEqual(store.lastErrorMessage, "Workspace publish receipt could not be saved.")
+    }
+
+    @MainActor
+    func testWorkspaceSynchronizePullsBeforePublishingLocalChanges() async throws {
+        let localUpdatedAt = Date(timeIntervalSince1970: 3_000)
+        let remoteUpdatedAt = Date(timeIntervalSince1970: 2_000)
+        var localState = WorkspaceState.seed()
+        localState.privacyMode = .standardCloud
+        localState.syncHealth.failingItems = 0
+        localState.syncHealth.queuedUploads = 0
+        localState.updatedAt = localUpdatedAt
+        localState.syncHealth.lastRemoteWorkspaceUpdatedAt = Date(timeIntervalSince1970: 1_000)
+        var remoteState = localState
+        remoteState.updatedAt = remoteUpdatedAt
+        remoteState.syncHealth.lastRemoteWorkspaceUpdatedAt = remoteUpdatedAt
+        let receipt = WorkspaceSyncPushReceipt(
+            workspaceID: "workspace_alpha",
+            acceptedUpdatedAt: localUpdatedAt
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let transport = SequencedHTTPRequestTransport(responses: [
+            HTTPTestResponse(data: try encoder.encode(remoteState), statusCode: 200),
+            HTTPTestResponse(data: try encoder.encode(receipt), statusCode: 200)
+        ])
+        let store = IdeaForgeStore(
+            state: localState,
+            repository: InMemoryWorkspaceRepository(state: localState)
+        )
+        let engine = WorkspaceSyncEngine(
+            client: BackendWorkspaceSyncClient(
+                configuration: BackendSyncConfiguration(
+                    baseURL: URL(string: "https://api.example.test")!,
+                    bearerToken: "sync-token",
+                    workspaceID: "workspace_alpha"
+                ),
+                transport: transport
+            )
+        )
+
+        let summary = try await engine.synchronize(store: store, syncedAt: Date(timeIntervalSince1970: 4_000))
+        let requests = await transport.capturedRequests()
+
+        XCTAssertEqual(requests.map(\.httpMethod), ["GET", "PUT"])
+        XCTAssertEqual(
+            requests.last?.value(forHTTPHeaderField: "X-IdeaForge-Base-Remote-Updated-At"),
+            "1970-01-01T00:33:20Z"
+        )
+        XCTAssertTrue(summary.pushedLocalSnapshot)
+        XCTAssertEqual(store.syncHealth.lastRemoteWorkspaceUpdatedAt, localUpdatedAt)
+    }
+
+    @MainActor
+    func testWorkspaceSynchronizeMergesNonOverlappingWatchCaptureAndPublishesForMac() async throws {
+        let remoteUpdatedAt = Date(timeIntervalSince1970: 2_000)
+        let localUpdatedAt = Date(timeIntervalSince1970: 3_000)
+        var localState = WorkspaceState.seed()
+        localState.privacyMode = .standardCloud
+        var watchProject = localState.projects[0]
+        watchProject.id = "idea_watch_handoff"
+        watchProject.title = "Watch handoff"
+        watchProject.updatedAt = localUpdatedAt
+        var watchRecording = watchProject.recordings[0]
+        watchRecording.id = "rec_watch_handoff"
+        watchRecording.ideaProjectID = watchProject.id
+        watchRecording.localFileStatus = .uploaded
+        watchRecording.syncStatus = .transferredToIPhone
+        watchRecording.localAudioPath = "recordings/rec_watch_handoff.m4a"
+        watchRecording.audioObjectKey = "audio/idea_watch_handoff/rec_watch_handoff.m4a"
+        watchProject.recordings = [watchRecording]
+        localState.projects = [watchProject]
+        localState.selectedProjectID = watchProject.id
+        localState.uploadJobs = [
+            UploadJob(
+                id: "upload_rec_watch_handoff",
+                recordingID: watchRecording.id,
+                ideaProjectID: watchProject.id,
+                localAudioPath: try XCTUnwrap(watchRecording.localAudioPath),
+                status: .uploaded,
+                attemptCount: 1,
+                nextAttemptAt: localUpdatedAt,
+                objectKey: watchRecording.audioObjectKey,
+                createdAt: localUpdatedAt,
+                updatedAt: localUpdatedAt
+            )
+        ]
+        localState.syncHealth = SyncHealth(
+            watchReachable: true,
+            queuedUploads: 0,
+            lastSuccessfulSync: .distantPast,
+            failingItems: 0
+        )
+        localState.updatedAt = localUpdatedAt
+
+        var remoteState = WorkspaceState.seed()
+        remoteState.privacyMode = .standardCloud
+        remoteState.projects = [remoteState.projects[1]]
+        remoteState.selectedProjectID = remoteState.projects[0].id
+        remoteState.uploadJobs = []
+        remoteState.updatedAt = remoteUpdatedAt
+        let receipt = WorkspaceSyncPushReceipt(
+            workspaceID: "workspace_alpha",
+            acceptedUpdatedAt: Date(timeIntervalSince1970: 4_000)
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let transport = SequencedHTTPRequestTransport(responses: [
+            HTTPTestResponse(data: try encoder.encode(remoteState), statusCode: 200),
+            HTTPTestResponse(data: try encoder.encode(receipt), statusCode: 200)
+        ])
+        let repository = InMemoryWorkspaceRepository(state: localState)
+        let store = IdeaForgeStore(state: localState, repository: repository)
+        let engine = WorkspaceSyncEngine(
+            client: BackendWorkspaceSyncClient(
+                configuration: BackendSyncConfiguration(
+                    baseURL: URL(string: "https://api.example.test")!,
+                    bearerToken: "sync-token",
+                    workspaceID: "workspace_alpha"
+                ),
+                transport: transport
+            )
+        )
+
+        let summary = try await engine.synchronize(store: store, syncedAt: Date(timeIntervalSince1970: 5_000))
+        let requests = await transport.capturedRequests()
+        let pushedData = try XCTUnwrap(requests.last?.httpBody)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let pushedState = try decoder.decode(WorkspaceState.self, from: pushedData)
+
+        XCTAssertTrue(summary.pushedLocalSnapshot)
+        XCTAssertEqual(requests.map(\.httpMethod), ["GET", "PUT"])
+        XCTAssertEqual(Set(store.projects.map(\.id)), ["idea_watch_handoff", remoteState.projects[0].id])
+        XCTAssertEqual(Set(pushedState.projects.map(\.id)), ["idea_watch_handoff", remoteState.projects[0].id])
+        XCTAssertNil(store.syncHealth.syncConflictStatus)
+    }
+
+    func testBackendWorkspaceSyncClientRejectsDuplicateRemoteProjectIDs() async throws {
+        var remoteState = WorkspaceState.seed()
+        remoteState.projects.append(remoteState.projects[0])
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let client = BackendWorkspaceSyncClient(
+            configuration: BackendSyncConfiguration(
+                baseURL: URL(string: "https://api.example.test")!,
+                bearerToken: "sync-token",
+                workspaceID: "workspace_alpha"
+            ),
+            transport: CapturingHTTPRequestTransport(
+                responseData: try encoder.encode(remoteState),
+                statusCode: 200
+            )
+        )
+
+        do {
+            _ = try await client.fetchWorkspaceSnapshot(since: nil)
+            XCTFail("Expected duplicate remote identifiers to fail closed.")
+        } catch {
+            XCTAssertEqual(error as? BackendSyncError, .invalidResponse)
+        }
+    }
+
+    func testBackendWorkspaceSyncClientRejectsBrokenWorkspaceRelationships() async throws {
+        var wrongNestedProject = WorkspaceState.seed()
+        wrongNestedProject.projects[0].recordings[0].ideaProjectID = wrongNestedProject.projects[1].id
+
+        var wrongJobProject = WorkspaceState.seed()
+        let jobRecording = wrongJobProject.projects[0].recordings[0]
+        wrongJobProject.uploadJobs = [
+            UploadJob(
+                id: "upload_wrong_relationship",
+                recordingID: jobRecording.id,
+                ideaProjectID: wrongJobProject.projects[1].id,
+                localAudioPath: jobRecording.localAudioPath ?? "recordings/wrong-relationship.m4a",
+                status: .uploaded,
+                attemptCount: 1,
+                nextAttemptAt: SampleData.now,
+                objectKey: "audio/wrong-relationship.m4a",
+                createdAt: SampleData.now,
+                updatedAt: SampleData.now
+            )
+        ]
+
+        var missingSelection = WorkspaceState.seed()
+        missingSelection.selectedProjectID = "idea_missing"
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        for invalidState in [wrongNestedProject, wrongJobProject, missingSelection] {
+            let client = BackendWorkspaceSyncClient(
+                configuration: BackendSyncConfiguration(
+                    baseURL: URL(string: "https://api.example.test")!,
+                    bearerToken: "sync-token",
+                    workspaceID: "workspace_alpha"
+                ),
+                transport: CapturingHTTPRequestTransport(
+                    responseData: try encoder.encode(invalidState),
+                    statusCode: 200
+                )
+            )
+            do {
+                _ = try await client.fetchWorkspaceSnapshot(since: nil)
+                XCTFail("Expected inconsistent workspace relationships to fail closed.")
+            } catch {
+                XCTAssertEqual(error as? BackendSyncError, .invalidResponse)
+            }
+        }
+    }
+
+    func testBackendWorkspaceSyncClientRetriesUnconditionallyAfterNotModifiedResponse() async throws {
+        var remoteState = WorkspaceState.seed()
+        remoteState.updatedAt = SampleData.now
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let transport = SequencedHTTPRequestTransport(responses: [
+            HTTPTestResponse(data: Data(), statusCode: 304),
+            HTTPTestResponse(data: try encoder.encode(remoteState), statusCode: 200)
+        ])
+        let client = BackendWorkspaceSyncClient(
+            configuration: BackendSyncConfiguration(
+                baseURL: URL(string: "https://api.example.test")!,
+                bearerToken: "sync-token",
+                workspaceID: "workspace_alpha"
+            ),
+            transport: transport
+        )
+
+        let fetched = try await client.fetchWorkspaceSnapshot(since: SampleData.now)
+        let requests = await transport.capturedRequests()
+
+        XCTAssertEqual(fetched, remoteState)
+        XCTAssertNotNil(requests.first?.url?.query)
+        XCTAssertNil(requests.last?.url?.query)
+    }
+
+    @MainActor
+    func testWorkspaceSynchronizeRechecksPublicationPolicyAfterRemoteFetch() async throws {
+        let baseAt = Date().addingTimeInterval(-60)
+        var remoteState = WorkspaceState.fresh()
+        remoteState.privacyMode = .standardCloud
+        remoteState.updatedAt = Date().addingTimeInterval(60)
+        var localState = remoteState
+        localState.updatedAt = baseAt
+        localState.syncHealth.lastRemoteWorkspaceUpdatedAt = baseAt
+        localState.syncHealth.lastPublishedLocalUpdatedAt = baseAt
+        let store = IdeaForgeStore(state: localState, repository: InMemoryWorkspaceRepository(state: localState))
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let transport = MutatingSequencedHTTPRequestTransport(
+            responses: [HTTPTestResponse(data: try encoder.encode(remoteState), statusCode: 200)],
+            mutation: {
+                let recording = Recording(
+                    id: "rec_arrived_during_fetch",
+                    ideaProjectID: "idea_arrived_during_fetch",
+                    deviceName: "Apple Watch",
+                    durationSeconds: 15,
+                    localFileStatus: .available,
+                    syncStatus: .transferredToIPhone,
+                    localAudioPath: "recordings/arrived-during-fetch.m4a",
+                    languageHint: "en-US",
+                    createdAt: Date(),
+                    markerOffsets: []
+                )
+                _ = store.createProject(
+                    from: RecordingDraft(
+                        projectTitle: "Arrived during fetch",
+                        tag: .appIdea,
+                        source: .watch,
+                        durationSeconds: recording.durationSeconds,
+                        transcriptHint: "Wait for upload.",
+                        localAudioPath: recording.localAudioPath,
+                        languageHint: recording.languageHint,
+                        ideaProjectID: recording.ideaProjectID,
+                        recordingID: recording.id
+                    ),
+                    transcript: Transcript(cleanText: "Wait for upload.", segments: [], unclearFragments: []),
+                    recording: recording
+                )
+            }
+        )
+        let engine = WorkspaceSyncEngine(
+            client: BackendWorkspaceSyncClient(
+                configuration: BackendSyncConfiguration(
+                    baseURL: URL(string: "https://api.example.test")!,
+                    bearerToken: "sync-token",
+                    workspaceID: "workspace_alpha"
+                ),
+                transport: transport
+            )
+        )
+
+        do {
+            _ = try await engine.synchronize(store: store, syncedAt: Date().addingTimeInterval(120))
+            XCTFail("Expected the upload arriving during fetch to block publication.")
+        } catch let error as WorkspaceSyncPublicationBlockedError {
+            XCTAssertTrue(error.message.contains("upload work"))
+        }
+        let requests = await transport.capturedRequests()
+        XCTAssertEqual(requests.map(\.httpMethod), ["GET"])
+        XCTAssertEqual(store.activeUploadJobs.map(\.recordingID), ["rec_arrived_during_fetch"])
+    }
+
+    func testBackendWorkspaceSyncClientRejectsReceiptForDifferentWorkspace() async throws {
+        let receipt = WorkspaceSyncPushReceipt(
+            workspaceID: "workspace_other",
+            acceptedUpdatedAt: SampleData.now
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let client = BackendWorkspaceSyncClient(
+            configuration: BackendSyncConfiguration(
+                baseURL: URL(string: "https://api.example.test")!,
+                bearerToken: "sync-token",
+                workspaceID: "workspace_alpha"
+            ),
+            transport: CapturingHTTPRequestTransport(
+                responseData: try encoder.encode(receipt),
+                statusCode: 200
+            )
+        )
+
+        do {
+            _ = try await client.pushWorkspaceSnapshot(.fresh(), baseRemoteUpdatedAt: nil)
+            XCTFail("Expected a mismatched workspace receipt to fail closed.")
+        } catch {
+            XCTAssertEqual(error as? BackendSyncError, .invalidResponse)
+        }
     }
 
     @MainActor
@@ -5330,6 +6483,7 @@ final class IdeaForgeCoreTests: XCTestCase {
         var remoteState = WorkspaceState.seed()
         remoteState.updatedAt = remoteUpdatedAt
         remoteState.projects = []
+        remoteState.selectedProjectID = nil
         remoteState.uploadJobs = []
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -5605,7 +6759,8 @@ final class IdeaForgeCoreTests: XCTestCase {
         XCTAssertEqual(store.syncHealth.lastSuccessfulSync, syncedAt)
         XCTAssertEqual(store.selectedProjectID, "idea_remote")
         XCTAssertEqual(store.privacyMode, .standardCloud)
-        XCTAssertEqual(store.updatedAt, remoteUpdatedAt)
+        XCTAssertEqual(store.updatedAt, syncedAt)
+        XCTAssertEqual(store.syncHealth.lastRemoteWorkspaceUpdatedAt, remoteUpdatedAt)
 
         let saved = try XCTUnwrap(try repository.load())
         XCTAssertEqual(saved.projects.map(\.id).sorted(), ["idea_local_pending", "idea_remote"])
@@ -9311,6 +10466,39 @@ final class IdeaForgeCoreTests: XCTestCase {
     }
 
     @MainActor
+    func testConfiguredUploadProcessorDoesNotFallBackToLocalWhenEnabledCredentialsAreMissing() async throws {
+        let state = SampleData.taskFirstStore(state: .queuedUpload).workspaceState(now: SampleData.now)
+        let repository = InMemoryWorkspaceRepository(state: state)
+        let store = IdeaForgeStore(state: state, repository: repository)
+        let manager = BackendConfigurationManager(
+            settingsStore: InMemoryBackendSettingsStore(
+                settings: BackendConnectionSettings(
+                    baseURLString: "https://api.example.test",
+                    workspaceID: "workspace_alpha",
+                    isEnabled: true
+                )
+            ),
+            credentialStore: InMemoryBackendCredentialStore(token: nil)
+        )
+
+        do {
+            _ = try await ConfiguredUploadQueueProcessor(
+                backendConfigurationManager: manager
+            ).processDueUploads(in: store, now: SampleData.now.addingTimeInterval(1))
+            XCTFail("Expected missing enabled backend credentials to remain visible to the caller.")
+        } catch let error as BackendConfigurationError {
+            XCTAssertEqual(error, .missingRequiredConfiguration)
+        } catch {
+            XCTFail("Unexpected configured upload error: \(error)")
+        }
+
+        let saved = try XCTUnwrap(try repository.load())
+        XCTAssertEqual(saved.uploadJobs.first?.status, .waitingForRetry)
+        XCTAssertEqual(saved.uploadJobs.first?.failureCategory, .configuration)
+        XCTAssertNil(saved.uploadJobs.first?.objectKey)
+    }
+
+    @MainActor
     func testAppScopedUploadCoordinatorSerializesBackgroundAndForegroundRequests() async throws {
         let fixture = try FailedUploadFixture.make(source: .iphone)
         defer { try? fixture.fileManager.removeItem(at: fixture.directory) }
@@ -10922,6 +12110,18 @@ private final class ThrowingWorkspaceRepository: WorkspaceRepository, @unchecked
     }
 }
 
+private final class UnreadableWorkspaceRepository: WorkspaceRepository, @unchecked Sendable {
+    private(set) var saveCallCount = 0
+
+    func load() throws -> WorkspaceState? {
+        throw WorkspaceRepositoryError.unreadableState
+    }
+
+    func save(_ state: WorkspaceState) throws {
+        saveCallCount += 1
+    }
+}
+
 private struct FailedUploadFixture {
     var state: WorkspaceState
     var repository: InMemoryWorkspaceRepository
@@ -11301,5 +12501,56 @@ private actor SequencedHTTPRequestTransport: HTTPRequestTransport {
 
     func capturedRequests() -> [URLRequest] {
         requests
+    }
+}
+
+private actor MutatingSequencedHTTPRequestTransport: HTTPRequestTransport {
+    private var requests: [URLRequest] = []
+    private var responses: [HTTPTestResponse]
+    private var didMutate = false
+    private let mutation: @MainActor @Sendable () -> Void
+
+    init(
+        responses: [HTTPTestResponse],
+        mutation: @escaping @MainActor @Sendable () -> Void
+    ) {
+        self.responses = responses
+        self.mutation = mutation
+    }
+
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        requests.append(request)
+        if !didMutate {
+            didMutate = true
+            await mutation()
+        }
+        guard !responses.isEmpty else {
+            throw NSError(domain: "IdeaForgeTests", code: 3)
+        }
+        let next = responses.removeFirst()
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: next.statusCode,
+            httpVersion: nil,
+            headerFields: nil
+        )!
+        return (next.data, response)
+    }
+
+    func capturedRequests() -> [URLRequest] {
+        requests
+    }
+}
+
+private struct MutatingSyncQueueService: SyncQueueService {
+    var mutation: @MainActor @Sendable () -> Void
+
+    init(mutation: @escaping @MainActor @Sendable () -> Void) {
+        self.mutation = mutation
+    }
+
+    func enqueue(recording _: Recording) async throws -> SyncStatus {
+        await mutation()
+        return .pending
     }
 }

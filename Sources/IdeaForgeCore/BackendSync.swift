@@ -77,13 +77,20 @@ public struct BackendWorkspaceSyncClient: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         let (data, response) = try await transport.data(for: request)
+        if response.statusCode == 304, since != nil {
+            return try await fetchWorkspaceSnapshot(since: nil)
+        }
         guard (200..<300).contains(response.statusCode) else {
             throw BackendSyncError.requestFailed("HTTP \(response.statusCode)")
         }
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(WorkspaceState.self, from: data)
+        let state = try decoder.decode(WorkspaceState.self, from: data)
+        guard WorkspaceSyncPayloadPolicy.isStructurallyValid(state) else {
+            throw BackendSyncError.invalidResponse
+        }
+        return state
     }
 
     public func pushWorkspaceSnapshot(
@@ -105,19 +112,129 @@ public struct BackendWorkspaceSyncClient: Sendable {
 
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        request.httpBody = try encoder.encode(state)
+        request.httpBody = try encoder.encode(WorkspaceSyncPayloadPolicy.outboundState(from: state))
 
         let (data, response) = try await transport.data(for: request)
         switch response.statusCode {
         case 200..<300:
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            return try decoder.decode(WorkspaceSyncPushReceipt.self, from: data)
+            let receipt = try decoder.decode(WorkspaceSyncPushReceipt.self, from: data)
+            guard receipt.workspaceID == configuration.workspaceID else {
+                throw BackendSyncError.invalidResponse
+            }
+            return receipt
         case 409, 412:
             throw BackendSyncError.preconditionFailed("Remote workspace changed before local snapshot publish.")
         default:
             throw BackendSyncError.requestFailed("HTTP \(response.statusCode)")
         }
+    }
+}
+
+enum WorkspaceSyncPayloadPolicy {
+    static func isStructurallyValid(_ state: WorkspaceState) -> Bool {
+        let projectIDs = state.projects.map(\.id)
+        let recordings = state.projects.flatMap(\.recordings)
+        let recordingIDs = recordings.map(\.id)
+        let uploadJobIDs = state.uploadJobs.map(\.id)
+        let artifactIDs = state.projects.flatMap(\.artifacts).map(\.id)
+        guard hasUniqueNonemptyValues(projectIDs),
+              hasUniqueNonemptyValues(recordingIDs),
+              hasUniqueNonemptyValues(uploadJobIDs),
+              hasUniqueNonemptyValues(artifactIDs) else {
+            return false
+        }
+        let projectIDSet = Set(projectIDs)
+        guard state.selectedProjectID.map(projectIDSet.contains) ?? true else { return false }
+        var recordingProjectIDs: [String: String] = [:]
+        for project in state.projects {
+            for recording in project.recordings {
+                guard recording.ideaProjectID == project.id else { return false }
+                recordingProjectIDs[recording.id] = project.id
+            }
+        }
+        return state.uploadJobs.allSatisfy { job in
+            recordingProjectIDs[job.recordingID] == job.ideaProjectID
+        }
+    }
+
+    static func dictionaryByFirstID<Value>(
+        _ values: [Value],
+        id: (Value) -> String
+    ) -> [String: Value] {
+        var result: [String: Value] = [:]
+        for value in values where result[id(value)] == nil {
+            result[id(value)] = value
+        }
+        return result
+    }
+
+    static func outboundState(from state: WorkspaceState) -> WorkspaceState {
+        var outbound = state
+        outbound.projects = state.projects.map { project in
+            var project = project
+            project.recordings = project.recordings.map { recording in
+                var recording = recording
+                recording.localAudioPath = nil
+                recording.localFileStatus = recording.audioObjectKey == nil ? .missing : .uploaded
+                return recording
+            }
+            return project
+        }
+        outbound.uploadJobs = []
+        outbound.syncHealth.watchReachable = false
+        outbound.syncHealth.queuedUploads = 0
+        outbound.syncHealth.failingItems = 0
+        outbound.syncHealth.lastSuccessfulSync = .distantPast
+        outbound.syncHealth.lastRemoteWorkspaceUpdatedAt = nil
+        outbound.syncHealth.lastActivity = nil
+        outbound.syncHealth.syncConflictStatus = nil
+        outbound.syncHealth.lastPublishedLocalUpdatedAt = nil
+        return outbound
+    }
+
+    static func inboundState(
+        from remoteState: WorkspaceState,
+        preservingDeviceLocalState localState: WorkspaceState
+    ) -> WorkspaceState {
+        var inbound = remoteState
+        let localRecordings = dictionaryByFirstID(
+            localState.projects.flatMap(\.recordings),
+            id: \.id
+        )
+        var remoteRecordingIDs: Set<String> = []
+        inbound.projects = remoteState.projects.map { project in
+            var project = project
+            project.recordings = project.recordings.map { recording in
+                var recording = recording
+                remoteRecordingIDs.insert(recording.id)
+                if let localRecording = localRecordings[recording.id] {
+                    recording.localAudioPath = localRecording.localAudioPath
+                    recording.localFileStatus = localRecording.localFileStatus
+                } else {
+                    recording.localAudioPath = nil
+                    recording.localFileStatus = recording.audioObjectKey == nil ? .missing : .uploaded
+                }
+                return recording
+            }
+            return project
+        }
+        inbound.uploadJobs = localState.uploadJobs.filter {
+            remoteRecordingIDs.contains($0.recordingID)
+        }
+        inbound.syncHealth.watchReachable = localState.syncHealth.watchReachable
+        inbound.syncHealth.queuedUploads = inbound.uploadJobs.filter {
+            $0.status == .queued || $0.status == .uploading || $0.status == .waitingForRetry
+        }.count
+        inbound.syncHealth.failingItems = localState.syncHealth.failingItems
+        inbound.syncHealth.lastActivity = localState.syncHealth.lastActivity
+        inbound.syncHealth.lastPublishedLocalUpdatedAt = localState.syncHealth.lastPublishedLocalUpdatedAt
+        return inbound
+    }
+
+    private static func hasUniqueNonemptyValues(_ values: [String]) -> Bool {
+        values.allSatisfy { !$0.isEmpty } && Set(values).count == values.count
     }
 }
 
@@ -463,14 +580,25 @@ public struct WorkspaceSyncConflictReport: Equatable, Sendable {
         localState: WorkspaceState,
         remoteState: WorkspaceState
     ) -> [WorkspaceSyncProjectConflict] {
-        let lastSuccessfulSync = localState.syncHealth.lastSuccessfulSync
-        let remoteProjectsByID = Dictionary(uniqueKeysWithValues: remoteState.projects.map { ($0.id, $0) })
+        let localHasUnpublishedChanges: Bool
+        if let lastPublishedLocalUpdatedAt = localState.syncHealth.lastPublishedLocalUpdatedAt {
+            localHasUnpublishedChanges = localState.updatedAt > lastPublishedLocalUpdatedAt
+        } else {
+            localHasUnpublishedChanges = !localState.projects.isEmpty
+        }
+        let remoteHasUnappliedChanges = localState.syncHealth.lastRemoteWorkspaceUpdatedAt.map {
+            remoteState.updatedAt > $0
+        } ?? true
+        guard localHasUnpublishedChanges, remoteHasUnappliedChanges else { return [] }
+
+        let remoteProjectsByID = WorkspaceSyncPayloadPolicy.dictionaryByFirstID(
+            remoteState.projects,
+            id: \.id
+        )
 
         return localState.projects
             .compactMap { localProject -> WorkspaceSyncProjectConflict? in
-                guard let remoteProject = remoteProjectsByID[localProject.id],
-                      localProject.updatedAt > lastSuccessfulSync,
-                      remoteProject.updatedAt > lastSuccessfulSync else {
+                guard let remoteProject = remoteProjectsByID[localProject.id] else {
                     return nil
                 }
 
@@ -1212,8 +1340,14 @@ public struct WorkspaceSyncConflictStatus: Codable, Hashable, Sendable {
         localState: WorkspaceState,
         remoteState: WorkspaceState?
     ) -> [WorkspaceSyncConflictReviewItem] {
-        let localProjectsByID = Dictionary(uniqueKeysWithValues: localState.projects.map { ($0.id, $0) })
-        let remoteProjectsByID = Dictionary(uniqueKeysWithValues: remoteState?.projects.map { ($0.id, $0) } ?? [])
+        let localProjectsByID = WorkspaceSyncPayloadPolicy.dictionaryByFirstID(
+            localState.projects,
+            id: \.id
+        )
+        let remoteProjectsByID = WorkspaceSyncPayloadPolicy.dictionaryByFirstID(
+            remoteState?.projects ?? [],
+            id: \.id
+        )
         let localRecordingsByID = Dictionary(
             uniqueKeysWithValues: localState.projects.flatMap(\.recordings).map { ($0.id, $0) }
         )
@@ -1562,6 +1696,16 @@ public struct WorkspaceSyncConflictError: Error, Equatable, Sendable {
     }
 }
 
+public struct WorkspaceSyncPublicationBlockedError: Error, Equatable, Sendable, UserFacingIdeaForgeError {
+    public var message: String
+
+    public init(message: String) {
+        self.message = message
+    }
+
+    public var userFacingMessage: String { message }
+}
+
 public enum WorkspaceSyncConflictResolution: Sendable {
     case failClosed
     case preserveLocalUploadWork
@@ -1581,7 +1725,9 @@ public struct WorkspaceSyncEngine: Sendable {
         syncedAt: Date = Date()
     ) async throws -> WorkspaceSyncSummary {
         let localUpdatedAt = store.updatedAt
-        let remoteState = try await client.fetchWorkspaceSnapshot(since: localUpdatedAt)
+        let remoteState = try await client.fetchWorkspaceSnapshot(
+            since: store.syncHealth.lastRemoteWorkspaceUpdatedAt
+        )
         let applied = try store.applyRemoteWorkspaceSnapshot(remoteState, syncedAt: syncedAt)
         return WorkspaceSyncSummary(
             fetched: true,
@@ -1589,6 +1735,67 @@ public struct WorkspaceSyncEngine: Sendable {
             remoteUpdatedAt: remoteState.updatedAt,
             localUpdatedAt: localUpdatedAt
         )
+    }
+
+    @MainActor
+    public func synchronize(
+        store: IdeaForgeStore,
+        syncedAt: Date = Date()
+    ) async throws -> WorkspaceSyncSummary {
+        let remoteCursor = store.syncHealth.lastRemoteWorkspaceUpdatedAt
+        let remoteState = try await client.fetchWorkspaceSnapshot(
+            since: remoteCursor
+        )
+        let localState = store.workspaceState()
+        guard WorkspaceSyncPayloadPolicy.isStructurallyValid(localState) else {
+            throw BackendSyncError.invalidResponse
+        }
+        let normalizedRemoteState = WorkspaceSyncPayloadPolicy.inboundState(
+            from: remoteState,
+            preservingDeviceLocalState: localState
+        )
+        let conflictReport = WorkspaceSyncConflictReport.report(
+            localState: localState,
+            remoteState: normalizedRemoteState
+        )
+        let applied: Bool
+        if let conflictReport,
+           conflictReport.projectContentConflicts.isEmpty,
+           !conflictReport.localOnlyRecordingIDs.isEmpty || !conflictReport.localOnlyUploadJobIDs.isEmpty {
+            let recordingIDs = Set(conflictReport.localOnlyRecordingIDs)
+            let uploadJobIDs = localState.uploadJobs.compactMap { job in
+                recordingIDs.contains(job.recordingID) || conflictReport.localOnlyUploadJobIDs.contains(job.id)
+                    ? job.id
+                    : nil
+            }
+            applied = try store.applyRemoteWorkspaceSnapshot(
+                remoteState,
+                syncedAt: syncedAt,
+                conflictResolution: .preserveReviewedLocalWork(
+                    WorkspaceSyncConflictMergeSelection(
+                        uploadJobIDsToPreserve: uploadJobIDs,
+                        recordingIDsToPreserve: conflictReport.localOnlyRecordingIDs
+                    )
+                )
+            )
+        } else {
+            applied = try store.applyRemoteWorkspaceSnapshot(remoteState, syncedAt: syncedAt)
+        }
+        let pullSummary = WorkspaceSyncSummary(
+            fetched: true,
+            appliedRemoteSnapshot: applied,
+            remoteUpdatedAt: remoteState.updatedAt,
+            localUpdatedAt: localState.updatedAt
+        )
+        if applied, conflictReport != nil, store.updatedAt > remoteState.updatedAt {
+            return try await pushPolicyCheckedLocalSnapshot(from: store, syncedAt: syncedAt)
+        }
+        guard !pullSummary.appliedRemoteSnapshot,
+              let remoteUpdatedAt = pullSummary.remoteUpdatedAt,
+              store.updatedAt > remoteUpdatedAt else {
+            return pullSummary
+        }
+        return try await pushPolicyCheckedLocalSnapshot(from: store, syncedAt: syncedAt)
     }
 
     @MainActor
@@ -1602,16 +1809,19 @@ public struct WorkspaceSyncEngine: Sendable {
                 store.workspaceState(),
                 baseRemoteUpdatedAt: store.syncHealth.lastRemoteWorkspaceUpdatedAt
             )
-            store.markWorkspaceSnapshotPublished(
+            guard store.markWorkspaceSnapshotPublished(
                 remoteUpdatedAt: receipt.acceptedUpdatedAt,
+                publishedLocalUpdatedAt: localUpdatedAt,
                 syncedAt: syncedAt
-            )
+            ) else {
+                throw WorkspaceRepositoryError.unwritableState
+            }
             return WorkspaceSyncSummary(
                 fetched: false,
                 appliedRemoteSnapshot: false,
                 pushedLocalSnapshot: true,
                 remoteUpdatedAt: receipt.acceptedUpdatedAt,
-                acceptedLocalUpdatedAt: receipt.acceptedUpdatedAt,
+                acceptedLocalUpdatedAt: localUpdatedAt,
                 localUpdatedAt: localUpdatedAt
             )
         } catch BackendSyncError.preconditionFailed {
@@ -1627,18 +1837,24 @@ public struct WorkspaceSyncEngine: Sendable {
         syncedAt: Date = Date()
     ) async throws -> WorkspaceSyncSummary {
         let localUpdatedAt = store.updatedAt
-        let remoteState = try await client.fetchWorkspaceSnapshot(since: localUpdatedAt)
+        let remoteState = try await client.fetchWorkspaceSnapshot(
+            since: store.syncHealth.lastRemoteWorkspaceUpdatedAt
+        )
         let applied = try store.applyRemoteWorkspaceSnapshot(
             remoteState,
             syncedAt: syncedAt,
             conflictResolution: .preserveLocalUploadWork
         )
-        return WorkspaceSyncSummary(
+        let summary = WorkspaceSyncSummary(
             fetched: true,
             appliedRemoteSnapshot: applied,
             remoteUpdatedAt: remoteState.updatedAt,
             localUpdatedAt: localUpdatedAt
         )
+        if applied, store.updatedAt > remoteState.updatedAt {
+            return try await pushPolicyCheckedLocalSnapshot(from: store, syncedAt: syncedAt)
+        }
+        return summary
     }
 
     @MainActor
@@ -1648,18 +1864,36 @@ public struct WorkspaceSyncEngine: Sendable {
         syncedAt: Date = Date()
     ) async throws -> WorkspaceSyncSummary {
         let localUpdatedAt = store.updatedAt
-        let remoteState = try await client.fetchWorkspaceSnapshot(since: localUpdatedAt)
+        let remoteState = try await client.fetchWorkspaceSnapshot(
+            since: store.syncHealth.lastRemoteWorkspaceUpdatedAt
+        )
         let applied = try store.applyRemoteWorkspaceSnapshot(
             remoteState,
             syncedAt: syncedAt,
             conflictResolution: .preserveReviewedLocalWork(selection)
         )
-        return WorkspaceSyncSummary(
+        let summary = WorkspaceSyncSummary(
             fetched: true,
             appliedRemoteSnapshot: applied,
             remoteUpdatedAt: remoteState.updatedAt,
             localUpdatedAt: localUpdatedAt
         )
+        if applied, store.updatedAt > remoteState.updatedAt {
+            return try await pushPolicyCheckedLocalSnapshot(from: store, syncedAt: syncedAt)
+        }
+        return summary
+    }
+
+    @MainActor
+    private func pushPolicyCheckedLocalSnapshot(
+        from store: IdeaForgeStore,
+        syncedAt: Date
+    ) async throws -> WorkspaceSyncSummary {
+        let state = store.workspaceState()
+        if let decision = WorkspaceAutoSyncPolicy.localPreflightDecision(for: state) {
+            throw WorkspaceSyncPublicationBlockedError(message: decision.message)
+        }
+        return try await pushLocalSnapshot(from: store, syncedAt: syncedAt)
     }
 }
 

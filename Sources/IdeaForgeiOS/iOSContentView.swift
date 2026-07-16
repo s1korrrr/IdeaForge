@@ -73,7 +73,6 @@ struct iOSContentView: View {
     @State private var requestedAccountDestination: AccountDestination?
     @State private var recorder: LocalAudioRecorder
     @State private var isRecording = false
-    @State private var transferService: (any RecordingTransferService)?
     @State private var isProcessingUploads = false
     @State private var isSyncingWorkspace = false
     @State private var isProcessingAI = false
@@ -98,12 +97,13 @@ struct iOSContentView: View {
     @State private var isRegisteringPushNotifications = false
     @State private var isAwaitingPushDeviceToken = false
 
+    @MainActor
     init(
         store: IdeaForgeStore,
         backendConfigurationManager: BackendConfigurationManager = .production(),
         uploadProcessingCoordinator: UploadQueueProcessingCoordinator,
         commerceService: (any CommerceServicing)? = nil,
-        pushNotificationTokenCenter: PushNotificationTokenCenter = .shared
+        pushNotificationTokenCenter: PushNotificationTokenCenter
     ) {
         self.store = store
         self.backendConfigurationManager = backendConfigurationManager
@@ -414,7 +414,6 @@ struct iOSContentView: View {
             Text(store.lastErrorMessage ?? "")
         }
         .onAppear {
-            configureTransferServiceIfNeeded()
             configureRecordingRecovery()
             loadBackendConfiguration()
             Task {
@@ -620,37 +619,15 @@ struct iOSContentView: View {
         .processDueUploads(in: store)
     }
 
-    private func configureTransferServiceIfNeeded() {
-        guard transferService == nil else {
-            transferService?.activate()
-            return
-        }
-
-        let importer = TransferredRecordingImporter()
-        let service = RecordingTransferServiceFactory.platformDefault { fileURL, metadata in
-            do {
-                try await importer.importFile(
-                    sourceURL: fileURL,
-                    metadata: metadata,
-                    into: store
-                )
-                IdeaForgeLog.sync.info("Watch recording transfer imported")
-                return .imported
-            } catch {
-                store.lastErrorMessage = (error as? UserFacingIdeaForgeError)?.userFacingMessage ?? "Watch transfer import failed."
-                IdeaForgeLog.sync.error("Watch recording transfer import failed")
-                return .failed
-            }
-        }
-        transferService = service
-        service.activate()
-        IdeaForgeLog.sync.info("Watch recording transfer service activated")
-    }
-
     private func loadBackendConfiguration() {
         do {
             backendSettings = try backendConfigurationManager.loadSettings()
-            let hasToken = try backendConfigurationManager.credentialStore.loadBearerToken()?.isEmpty == false
+            let hasToken: Bool
+            if backendSettings.isEnabled {
+                hasToken = try backendConfigurationManager.credentialStore.loadBearerToken()?.isEmpty == false
+            } else {
+                hasToken = false
+            }
             if !backendSettings.isEnabled {
                 backendStatusMessage = "Local upload fallback active."
             } else if !backendSettings.hasValidBaseURL {
@@ -714,6 +691,22 @@ struct iOSContentView: View {
 
     private func syncBackendWorkspace() async {
         guard !isSyncingWorkspace else { return }
+        if case .blocked(_, let message) = WorkspaceAutoSyncPolicy.localPreflightDecision(
+            for: store.workspaceState()
+        ) {
+            backendStatusMessage = message
+            store.recordSyncActivity(
+                WorkspaceSyncActivityReceipt(
+                    source: .manualPublish,
+                    status: .blocked,
+                    title: "Publish paused",
+                    detail: message,
+                    occurredAt: Date()
+                )
+            )
+            IdeaForgeLog.sync.warning("Workspace backend sync skipped; local publication policy blocked action")
+            return
+        }
         let capabilityDecision = backendCapabilityDecision(requiredCapabilities: [.syncWorkspace])
         guard capabilityDecision.isAllowed else {
             backendStatusMessage = "Workspace sync needs validated backend capability. \(capabilityDecision.blockerSummary)"
@@ -751,7 +744,7 @@ struct iOSContentView: View {
             let engine = WorkspaceSyncEngine(
                 client: BackendWorkspaceSyncClient(configuration: configuration)
             )
-            let summary = try await engine.pushLocalSnapshot(from: store)
+            let summary = try await engine.synchronize(store: store)
             backendStatusMessage = summary.pushedLocalSnapshot
                 ? "Local workspace published for iPhone, Watch, and Mac sync."
                 : "Workspace already up to date across devices."
@@ -932,11 +925,15 @@ struct iOSContentView: View {
             if let conflict = store.syncHealth.syncConflictStatus,
                !conflict.reviewItems.isEmpty,
                let selection {
-                _ = try await engine.pullLatestApplyingReviewedMerge(into: store, selection: selection)
-                backendStatusMessage = "Workspace merged with reviewed local choices."
+                let summary = try await engine.pullLatestApplyingReviewedMerge(into: store, selection: selection)
+                backendStatusMessage = summary.pushedLocalSnapshot
+                    ? "Workspace merged with reviewed local choices and published."
+                    : "Workspace merged with reviewed local choices."
             } else {
-                _ = try await engine.pullLatestPreservingLocalUploadWork(into: store)
-                backendStatusMessage = "Workspace merged while preserving local upload work."
+                let summary = try await engine.pullLatestPreservingLocalUploadWork(into: store)
+                backendStatusMessage = summary.pushedLocalSnapshot
+                    ? "Workspace merged while preserving local upload work and published."
+                    : "Workspace merged while preserving local upload work."
             }
             IdeaForgeLog.sync.info("Workspace conflict merge completed")
         } catch BackendConfigurationError.invalidBaseURL {
@@ -1261,19 +1258,15 @@ struct iOSContentView: View {
         defer { isRegisteringPushNotifications = false }
 
         do {
-            let authorized = try await PushNotificationAuthorizationRequester.authorizeAndRequestDeviceToken()
-            guard authorized else {
-                isAwaitingPushDeviceToken = false
-                pushNotificationStatusMessage = PushNotificationRegistrationBlocker.notificationPermissionDenied.userFacingMessage
-                IdeaForgeLog.sync.warning("iOS push sync registration skipped; notification authorization denied")
-                return
-            }
+            let alertAuthorization = try await PushNotificationAuthorizationRequester.authorizeAndRequestDeviceToken()
 
             if let token = pushNotificationTokenCenter.deviceToken {
                 await registerPushDeviceToken(token)
             } else {
                 isAwaitingPushDeviceToken = true
-                pushNotificationStatusMessage = "Notification permission ready. Waiting for APNs device token."
+                pushNotificationStatusMessage = alertAuthorization == .denied
+                    ? "Silent push registration requested. Alerts remain off; waiting for the APNs device token."
+                    : "Notification registration requested. Waiting for the APNs device token."
                 IdeaForgeLog.sync.info("iOS push sync registration waiting for APNs device token")
             }
         } catch {

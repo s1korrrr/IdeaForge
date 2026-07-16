@@ -1231,6 +1231,7 @@ public final class IdeaForgeStore {
     public var lastErrorMessage: String?
     public var lastExportedPacketURL: URL?
     public var updatedAt: Date
+    public private(set) var workspaceLoadFailed = false
 
     private let repository: any WorkspaceRepository
 
@@ -1301,9 +1302,20 @@ public final class IdeaForgeStore {
     public static func production(
         repository: any WorkspaceRepository = JSONWorkspaceRepository.applicationSupport()
     ) -> IdeaForgeStore {
-        let state = (try? repository.load()) ?? WorkspaceState.seed()
+        let state: WorkspaceState
+        let loadErrorMessage: String?
+        do {
+            state = try repository.load() ?? .fresh()
+            loadErrorMessage = nil
+        } catch {
+            state = .fresh()
+            loadErrorMessage = "Workspace data could not be loaded. The original file was left unchanged."
+            IdeaForgeLog.lifecycle.error("Workspace load failed; existing storage was left unchanged")
+        }
         IdeaForgeLog.lifecycle.info("Loaded workspace with \(state.projects.count, privacy: .public) projects and \(state.uploadJobs.count, privacy: .public) upload jobs")
         let store = IdeaForgeStore(state: state, repository: repository)
+        store.lastErrorMessage = loadErrorMessage
+        store.workspaceLoadFailed = loadErrorMessage != nil
         store.recoverInterruptedUploads()
         return store
     }
@@ -1333,28 +1345,54 @@ public final class IdeaForgeStore {
         )
     }
 
+    private func restoreLiveState(_ state: WorkspaceState) {
+        projects = state.projects
+        workflowTemplates = state.workflowTemplates
+        uploadJobs = state.uploadJobs
+        selectedProjectID = state.selectedProjectID
+        privacyMode = state.privacyMode
+        syncHealth = state.syncHealth
+        updatedAt = state.updatedAt
+    }
+
     @discardableResult
     public func recordSyncActivity(
         _ receipt: WorkspaceSyncActivityReceipt,
         clearsLastError: Bool = false
     ) -> Bool {
+        let originalState = workspaceState()
         let previousError = lastErrorMessage
         syncHealth.lastActivity = receipt
         let persisted = persistCurrentState()
+        guard persisted else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Sync activity could not be saved."
+            return false
+        }
         if !clearsLastError {
             lastErrorMessage = previousError
         }
-        return persisted
+        return true
     }
 
     @discardableResult
     public func save(now: Date = Date()) -> Bool {
+        let originalUpdatedAt = updatedAt
         updatedAt = now
-        return persistCurrentState()
+        guard persistCurrentState() else {
+            updatedAt = originalUpdatedAt
+            return false
+        }
+        return true
     }
 
     @discardableResult
     private func persistCurrentState() -> Bool {
+        guard !workspaceLoadFailed else {
+            lastErrorMessage = "Workspace data could not be loaded. The original file was left unchanged."
+            IdeaForgeLog.workspace.error("Workspace persistence blocked because the stored workspace is unreadable")
+            return false
+        }
         do {
             try repository.save(workspaceState())
             lastErrorMessage = nil
@@ -1375,7 +1413,12 @@ public final class IdeaForgeStore {
     }
 
     @discardableResult
-    public func deleteProject(_ projectID: String, now: Date = Date()) -> Bool {
+    public func deleteProject(
+        _ projectID: String,
+        now: Date = Date(),
+        fileManager: FileManager = .default,
+        managedRecordingDirectory: URL? = nil
+    ) -> Bool {
         let readiness = projectDeletionReadiness(projectID: projectID)
         guard readiness.canDelete else {
             lastErrorMessage = readiness.message
@@ -1383,6 +1426,12 @@ public final class IdeaForgeStore {
             return false
         }
 
+        let originalState = workspaceState()
+        let deletedProject = projects.first { $0.id == projectID }
+        let recordingPaths = Set(
+            (deletedProject?.recordings.compactMap(\.localAudioPath) ?? [])
+                + uploadJobs.filter { $0.ideaProjectID == projectID }.map(\.localAudioPath)
+        )
         projects.removeAll { $0.id == projectID }
         uploadJobs.removeAll { $0.ideaProjectID == projectID }
         if selectedProjectID == projectID || selectedProjectID.map({ selectedID in
@@ -1392,8 +1441,26 @@ public final class IdeaForgeStore {
         }
         syncHealth.queuedUploads = activeUploadJobs.count
         updatedAt = now
+        guard persistCurrentState() else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Could not delete the project because the workspace was not saved."
+            return false
+        }
         IdeaForgeLog.workspace.info("Deleted project after safety checks; remaining projects: \(self.projects.count, privacy: .public)")
-        return persistCurrentState()
+        let survivingRecordingPaths = Set(
+            projects.flatMap(\.recordings).compactMap(\.localAudioPath)
+                + uploadJobs.map(\.localAudioPath)
+        )
+        let cleanupFailureCount = ManagedRecordingFileCleanup.removeFiles(
+            at: recordingPaths.subtracting(survivingRecordingPaths),
+            within: managedRecordingDirectory ?? ManagedRecordingFileCleanup.defaultDirectory(fileManager: fileManager),
+            fileManager: fileManager
+        )
+        if cleanupFailureCount > 0 {
+            lastErrorMessage = "Project deleted, but some local recording files could not be removed."
+            IdeaForgeLog.workspace.warning("Project recording cleanup was incomplete; failure count: \(cleanupFailureCount, privacy: .public)")
+        }
+        return true
     }
 
     public func setPrivacyMode(_ mode: PrivacyMode) {
@@ -1901,7 +1968,8 @@ public final class IdeaForgeStore {
     }
 
     @discardableResult
-    public func createProject(from draft: RecordingDraft, transcript: Transcript, recording: Recording) -> IdeaProject {
+    public func createProject(from draft: RecordingDraft, transcript: Transcript, recording: Recording) -> IdeaProject? {
+        let originalState = workspaceState()
         let now = Date()
         let projectID = recording.ideaProjectID
         let project = IdeaProject(
@@ -1934,23 +2002,75 @@ public final class IdeaForgeStore {
         enqueueUploadJobIfNeeded(for: recording, now: now)
         syncHealth.queuedUploads = activeUploadJobs.count
         IdeaForgeLog.recording.info("Created idea project from \(draft.source.rawValue, privacy: .public) capture; queued uploads: \(self.activeUploadJobs.count, privacy: .public)")
-        save()
+        guard save() else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Could not save workspace."
+            return nil
+        }
         return project
     }
 
-    public func attach(recording: Recording, to projectID: String, transcript: Transcript) {
-        guard let index = projects.firstIndex(where: { $0.id == projectID }) else { return }
+    @discardableResult
+    public func attach(recording: Recording, to projectID: String, transcript _: Transcript) -> Bool {
+        guard let index = projects.firstIndex(where: { $0.id == projectID }) else { return false }
         guard !projects[index].recordings.contains(where: { $0.id == recording.id }) else {
             IdeaForgeLog.recording.info("Skipped duplicate recording attach; project recording count: \(self.projects[index].recordings.count, privacy: .public)")
-            return
+            return true
         }
+        let originalState = workspaceState()
         projects[index].recordings.insert(recording, at: 0)
-        projects[index].transcript = transcript
         projects[index].updatedAt = Date()
         enqueueUploadJobIfNeeded(for: recording)
         syncHealth.queuedUploads = activeUploadJobs.count
         IdeaForgeLog.recording.info("Attached recording to existing project; queued uploads: \(self.activeUploadJobs.count, privacy: .public)")
-        save()
+        guard save() else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Could not save workspace."
+            return false
+        }
+        return true
+    }
+
+    @discardableResult
+    public func repairTransferredRecordingAudio(
+        recordingID: String,
+        localAudioPath: String,
+        now: Date = Date()
+    ) -> IdeaProject? {
+        guard let projectIndex = projects.firstIndex(where: { project in
+            project.recordings.contains { $0.id == recordingID }
+        }), let recordingIndex = projects[projectIndex].recordings.firstIndex(where: { $0.id == recordingID }) else {
+            return nil
+        }
+        let originalState = workspaceState()
+        let wasFailed = projects[projectIndex].recordings[recordingIndex].syncStatus == .failed
+        projects[projectIndex].recordings[recordingIndex].localAudioPath = localAudioPath
+        projects[projectIndex].recordings[recordingIndex].localFileStatus = .available
+        projects[projectIndex].recordings[recordingIndex].syncStatus = .transferredToIPhone
+        projects[projectIndex].recordings[recordingIndex].processingDiagnostic = nil
+        projects[projectIndex].updatedAt = max(projects[projectIndex].updatedAt, now)
+        if let jobIndex = uploadJobs.firstIndex(where: { $0.recordingID == recordingID }) {
+            uploadJobs[jobIndex].localAudioPath = localAudioPath
+            uploadJobs[jobIndex].status = .queued
+            uploadJobs[jobIndex].attemptCount = 0
+            uploadJobs[jobIndex].nextAttemptAt = now
+            uploadJobs[jobIndex].objectKey = nil
+            uploadJobs[jobIndex].lastErrorMessage = nil
+            uploadJobs[jobIndex].failureCategory = nil
+            uploadJobs[jobIndex].updatedAt = now
+        } else {
+            enqueueUploadJobIfNeeded(for: projects[projectIndex].recordings[recordingIndex], now: now)
+        }
+        if wasFailed {
+            syncHealth.failingItems = max(0, syncHealth.failingItems - 1)
+        }
+        syncHealth.queuedUploads = activeUploadJobs.count
+        guard save(now: max(originalState.updatedAt, now)) else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Transferred recording repair could not be saved."
+            return nil
+        }
+        return projects[projectIndex]
     }
 
     @MainActor
@@ -1985,9 +2105,17 @@ public final class IdeaForgeStore {
             createdAt: now,
             markerOffsets: draft.markerOffsets
         )
-
         do {
             let syncStatus = try await services.syncQueue.enqueue(recording: initialRecording)
+            guard let projectIndex = projects.firstIndex(where: { $0.id == projectID }) else {
+                lastErrorMessage = "Idea missing."
+                IdeaForgeLog.recording.warning("Watch append stopped because the target project changed while queueing")
+                return nil
+            }
+            if let existing = projects[projectIndex].recordings.first(where: { $0.id == recordingID }) {
+                return existing
+            }
+            let originalState = workspaceState()
             let recording = Recording(
                 id: initialRecording.id,
                 ideaProjectID: initialRecording.ideaProjectID,
@@ -2016,7 +2144,12 @@ public final class IdeaForgeStore {
             enqueueUploadJobIfNeeded(for: recording, now: now)
             syncHealth.queuedUploads = activeUploadJobs.count
             IdeaForgeLog.recording.info("Appended watch recording to existing project; queued uploads: \(self.activeUploadJobs.count, privacy: .public)")
-            save(now: now)
+            guard save(now: now) else {
+                restoreLiveState(originalState)
+                lastErrorMessage = "Watch append could not be saved."
+                IdeaForgeLog.recording.error("Watch append failed because workspace persistence failed")
+                return nil
+            }
             return recording
         } catch {
             lastErrorMessage = "Append failed."
@@ -2284,26 +2417,50 @@ public final class IdeaForgeStore {
         save()
     }
 
-    public func markUploadSucceeded(recordingID: String, objectKey: String, now: Date = Date()) {
-        guard let jobIndex = uploadJobs.firstIndex(where: { $0.recordingID == recordingID }) else { return }
+    @discardableResult
+    public func markUploadSucceeded(recordingID: String, objectKey: String, now: Date = Date()) -> Bool {
+        guard let jobIndex = uploadJobs.firstIndex(where: { $0.recordingID == recordingID }) else { return false }
+        guard recording(withID: recordingID) != nil else { return false }
+        let originalState = workspaceState()
         uploadJobs[jobIndex] = UploadQueuePolicy.markUploaded(uploadJobs[jobIndex], objectKey: objectKey, now: now)
-        updateRecording(recordingID: recordingID, event: .uploaded(objectKey: objectKey))
+        updateRecording(recordingID: recordingID, event: .uploaded(objectKey: objectKey), now: now)
         syncHealth.queuedUploads = activeUploadJobs.count
         IdeaForgeLog.sync.info("Upload succeeded for recording \(recordingID, privacy: .private); queued uploads: \(self.activeUploadJobs.count, privacy: .public)")
-        save(now: now)
+        guard save(now: max(originalState.updatedAt, now)) else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Upload completion could not be saved."
+            return false
+        }
+        return true
     }
 
-    public func markRecordingTransferredToIPhone(recordingID: String, now: Date = Date()) {
-        updateRecording(recordingID: recordingID, event: .transferredToIPhone)
+    @discardableResult
+    public func markRecordingTransferredToIPhone(recordingID: String, now: Date = Date()) -> Bool {
+        guard recording(withID: recordingID) != nil else { return false }
+        let originalState = workspaceState()
+        updateRecording(recordingID: recordingID, event: .transferredToIPhone, now: now)
         syncHealth.queuedUploads = activeUploadJobs.count
         IdeaForgeLog.sync.info("Watch recording import acknowledged by iPhone; recording: \(recordingID, privacy: .private)")
-        save(now: now)
+        guard save(now: max(originalState.updatedAt, now)) else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Watch transfer receipt could not be saved."
+            return false
+        }
+        return true
     }
 
-    public func markRecordingWatchTransferFailed(recordingID: String, now: Date = Date()) {
-        updateRecording(recordingID: recordingID, event: .watchTransferFailed)
+    @discardableResult
+    public func markRecordingWatchTransferFailed(recordingID: String, now: Date = Date()) -> Bool {
+        guard recording(withID: recordingID) != nil else { return false }
+        let originalState = workspaceState()
+        updateRecording(recordingID: recordingID, event: .watchTransferFailed, now: now)
         IdeaForgeLog.sync.error("Watch recording transfer delivery failed; recording: \(recordingID, privacy: .private)")
-        save(now: now)
+        guard save(now: max(originalState.updatedAt, now)) else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Watch transfer failure could not be saved."
+            return false
+        }
+        return true
     }
 
     @MainActor
@@ -2420,14 +2577,39 @@ public final class IdeaForgeStore {
 
     @discardableResult
     public func applyRemoteWorkspaceSnapshot(
-        _ remoteState: WorkspaceState,
+        _ incomingRemoteState: WorkspaceState,
         syncedAt: Date = Date(),
         conflictResolution: WorkspaceSyncConflictResolution = .failClosed
     ) throws -> Bool {
-        guard remoteState.updatedAt > updatedAt else {
+        let originalState = workspaceState()
+        guard WorkspaceSyncPayloadPolicy.isStructurallyValid(originalState),
+              WorkspaceSyncPayloadPolicy.isStructurallyValid(incomingRemoteState) else {
+            throw BackendSyncError.invalidResponse
+        }
+        let remoteState = WorkspaceSyncPayloadPolicy.inboundState(
+            from: incomingRemoteState,
+            preservingDeviceLocalState: originalState
+        )
+        let isInitialHydration = syncHealth.lastRemoteWorkspaceUpdatedAt == nil
+        let isResolvingKnownConflict: Bool
+        switch conflictResolution {
+        case .failClosed:
+            isResolvingKnownConflict = false
+        case .preserveLocalUploadWork, .preserveReviewedLocalWork:
+            isResolvingKnownConflict = syncHealth.syncConflictStatus != nil
+                && syncHealth.lastRemoteWorkspaceUpdatedAt == remoteState.updatedAt
+        }
+        guard isInitialHydration || isResolvingKnownConflict || remoteState.updatedAt > updatedAt else {
             syncHealth.lastSuccessfulSync = syncedAt
-            syncHealth.lastRemoteWorkspaceUpdatedAt = remoteState.updatedAt
-            persistCurrentState()
+            syncHealth.lastRemoteWorkspaceUpdatedAt = max(
+                syncHealth.lastRemoteWorkspaceUpdatedAt ?? remoteState.updatedAt,
+                remoteState.updatedAt
+            )
+            guard persistCurrentState() else {
+                restoreLiveState(originalState)
+                lastErrorMessage = "Remote workspace could not be saved."
+                throw WorkspaceRepositoryError.unwritableState
+            }
             IdeaForgeLog.sync.info("Remote workspace snapshot ignored because local state is current")
             return false
         }
@@ -2439,7 +2621,7 @@ public final class IdeaForgeStore {
         ) {
             switch conflictResolution {
             case .preserveLocalUploadWork:
-                applyMergedRemoteSnapshot(
+                try applyMergedRemoteSnapshot(
                     remoteState,
                     preserving: .preserveAll(report: conflictReport),
                     from: localState,
@@ -2447,7 +2629,7 @@ public final class IdeaForgeStore {
                 )
                 return true
             case .preserveReviewedLocalWork(let selection):
-                applyMergedRemoteSnapshot(
+                try applyMergedRemoteSnapshot(
                     remoteState,
                     preserving: selection,
                     from: localState,
@@ -2467,7 +2649,11 @@ public final class IdeaForgeStore {
                 remoteState: remoteState,
                 detectedAt: syncedAt
             )
-            persistCurrentState()
+            guard persistCurrentState() else {
+                restoreLiveState(originalState)
+                lastErrorMessage = "Remote workspace could not be saved."
+                throw WorkspaceRepositoryError.unwritableState
+            }
             lastErrorMessage = conflictReport.message
             IdeaForgeLog.sync.error("Remote workspace snapshot blocked by sync conflict; local upload jobs: \(conflictReport.localOnlyUploadJobIDs.count, privacy: .public), local recordings: \(conflictReport.localOnlyRecordingIDs.count, privacy: .public)")
             throw WorkspaceSyncConflictError(report: conflictReport)
@@ -2475,7 +2661,7 @@ public final class IdeaForgeStore {
 
         if case .preserveReviewedLocalWork(let selection) = conflictResolution,
            selection.hasProjectMergeWork {
-            applyMergedRemoteSnapshot(
+            try applyMergedRemoteSnapshot(
                 remoteState,
                 preserving: selection,
                 from: localState,
@@ -2495,20 +2681,33 @@ public final class IdeaForgeStore {
         syncHealth.queuedUploads = activeUploadJobs.count
         syncHealth.syncConflictStatus = nil
         updatedAt = remoteState.updatedAt
-        persistCurrentState()
+        guard persistCurrentState() else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Remote workspace could not be saved."
+            throw WorkspaceRepositoryError.unwritableState
+        }
         IdeaForgeLog.sync.info("Remote workspace snapshot applied with \(self.projects.count, privacy: .public) projects")
         return true
     }
 
+    @discardableResult
     public func markWorkspaceSnapshotPublished(
         remoteUpdatedAt: Date,
+        publishedLocalUpdatedAt: Date,
         syncedAt: Date = Date()
-    ) {
+    ) -> Bool {
+        let originalState = workspaceState()
         syncHealth.lastSuccessfulSync = syncedAt
         syncHealth.lastRemoteWorkspaceUpdatedAt = remoteUpdatedAt
+        syncHealth.lastPublishedLocalUpdatedAt = publishedLocalUpdatedAt
         syncHealth.syncConflictStatus = nil
-        persistCurrentState()
+        guard persistCurrentState() else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Workspace publish receipt could not be saved."
+            return false
+        }
         IdeaForgeLog.sync.info("Local workspace snapshot published to backend")
+        return true
     }
 
     private func applyMergedRemoteSnapshot(
@@ -2516,10 +2715,13 @@ public final class IdeaForgeStore {
         preserving selection: WorkspaceSyncConflictMergeSelection,
         from localState: WorkspaceState,
         syncedAt: Date
-    ) {
+    ) throws {
         let protectedRecordingIDs = Set(selection.recordingIDsToPreserve)
         let protectedUploadJobIDs = Set(selection.uploadJobIDsToPreserve)
-        let localProjectsByID = Dictionary(uniqueKeysWithValues: localState.projects.map { ($0.id, $0) })
+        let localProjectsByID = WorkspaceSyncPayloadPolicy.dictionaryByFirstID(
+            localState.projects,
+            id: \.id
+        )
         let remoteProjectIDs = Set(remoteState.projects.map(\.id))
         var mergedProjects = remoteState.projects
 
@@ -2584,9 +2786,13 @@ public final class IdeaForgeStore {
         syncHealth.lastRemoteWorkspaceUpdatedAt = remoteState.updatedAt
         syncHealth.queuedUploads = activeUploadJobs.count
         syncHealth.syncConflictStatus = nil
-        updatedAt = remoteState.updatedAt
+        updatedAt = max(syncedAt, remoteState.updatedAt.addingTimeInterval(0.001))
         lastErrorMessage = nil
-        persistCurrentState()
+        guard persistCurrentState() else {
+            restoreLiveState(localState)
+            lastErrorMessage = "Remote workspace merge could not be saved."
+            throw WorkspaceRepositoryError.unwritableState
+        }
         IdeaForgeLog.sync.info("Remote workspace snapshot merged with protected local upload work; preserved upload jobs: \(preservedUploadJobs.count, privacy: .public), preserved recordings: \(protectedRecordingIDs.count, privacy: .public)")
     }
 
@@ -2897,16 +3103,24 @@ public final class IdeaForgeStore {
         }
     }
 
-    public func markUploadStarted(recordingID: String, now: Date = Date()) {
-        guard let jobIndex = uploadJobs.firstIndex(where: { $0.recordingID == recordingID }) else { return }
+    @discardableResult
+    public func markUploadStarted(recordingID: String, now: Date = Date()) -> Bool {
+        guard let jobIndex = uploadJobs.firstIndex(where: { $0.recordingID == recordingID }) else { return false }
+        let originalState = workspaceState()
         uploadJobs[jobIndex] = UploadQueuePolicy.markUploading(uploadJobs[jobIndex], now: now)
         syncHealth.queuedUploads = activeUploadJobs.count
         IdeaForgeLog.sync.info("Upload started for recording \(recordingID, privacy: .private)")
-        save(now: now)
+        guard save(now: max(originalState.updatedAt, now)) else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Upload start could not be saved."
+            return false
+        }
+        return true
     }
 
     @discardableResult
     public func recoverInterruptedUploads(now: Date = Date()) -> Int {
+        let originalState = workspaceState()
         var recoveredCount = 0
         for index in uploadJobs.indices where UploadQueuePolicy.isInterruptedUpload(uploadJobs[index], now: now) {
             uploadJobs[index] = UploadQueuePolicy.markInterruptedForRetry(uploadJobs[index], now: now)
@@ -2914,18 +3128,24 @@ public final class IdeaForgeStore {
         }
         guard recoveredCount > 0 else { return 0 }
         syncHealth.queuedUploads = activeUploadJobs.count
+        guard save(now: max(originalState.updatedAt, now)) else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Interrupted upload recovery could not be saved."
+            return 0
+        }
         IdeaForgeLog.sync.warning("Recovered interrupted upload jobs; count: \(recoveredCount, privacy: .public)")
-        save(now: now)
         return recoveredCount
     }
 
+    @discardableResult
     public func markUploadFailed(
         recordingID: String,
         message: String,
         category: UploadFailureCategory = .uploadError,
         now: Date = Date()
-    ) {
-        guard let jobIndex = uploadJobs.firstIndex(where: { $0.recordingID == recordingID }) else { return }
+    ) -> Bool {
+        guard let jobIndex = uploadJobs.firstIndex(where: { $0.recordingID == recordingID }) else { return false }
+        let originalState = workspaceState()
         uploadJobs[jobIndex] = UploadQueuePolicy.markFailed(
             uploadJobs[jobIndex],
             message: message,
@@ -2933,12 +3153,17 @@ public final class IdeaForgeStore {
             now: now
         )
         if uploadJobs[jobIndex].status == .permanentlyFailed {
-            updateRecording(recordingID: recordingID, event: .failed)
+            updateRecording(recordingID: recordingID, event: .failed, now: now)
             syncHealth.failingItems += 1
         }
         syncHealth.queuedUploads = activeUploadJobs.count
         IdeaForgeLog.sync.error("Upload failed for recording \(recordingID, privacy: .private); status: \(self.uploadJobs[jobIndex].status.rawValue, privacy: .public)")
-        save(now: now)
+        guard save(now: max(originalState.updatedAt, now)) else {
+            restoreLiveState(originalState)
+            lastErrorMessage = "Upload failure could not be saved."
+            return false
+        }
+        return true
     }
 
     public func canRetryUpload(recordingID: String, fileManager: FileManager = .default) -> Bool {
@@ -2979,6 +3204,11 @@ public final class IdeaForgeStore {
         now: Date = Date(),
         fileManager: FileManager = .default
     ) -> Bool {
+        guard !workspaceLoadFailed else {
+            lastErrorMessage = "Workspace data could not be loaded. The original file was left unchanged."
+            IdeaForgeLog.workspace.error("Upload retry blocked because the stored workspace is unreadable")
+            return false
+        }
         guard
             let jobIndex = uploadJobs.firstIndex(where: { $0.recordingID == recordingID }),
             let retriedJob = UploadQueuePolicy.manualRetry(uploadJobs[jobIndex], now: now),
@@ -3084,14 +3314,14 @@ public final class IdeaForgeStore {
         return recording.syncStatus == .pending || recording.syncStatus == .failed
     }
 
-    private func updateRecording(recordingID: String, event: RecordingQueueEvent) {
+    private func updateRecording(recordingID: String, event: RecordingQueueEvent, now: Date = Date()) {
         for projectIndex in projects.indices {
             guard let recordingIndex = projects[projectIndex].recordings.firstIndex(where: { $0.id == recordingID }) else {
                 continue
             }
             if let updated = try? RecordingQueuePolicy.applying(event, to: projects[projectIndex].recordings[recordingIndex]) {
                 projects[projectIndex].recordings[recordingIndex] = updated
-                projects[projectIndex].updatedAt = Date()
+                projects[projectIndex].updatedAt = max(projects[projectIndex].updatedAt, now)
             }
             return
         }
@@ -3201,6 +3431,11 @@ public final class IdeaForgeStore {
                 markerOffsets: initialRecording.markerOffsets
             )
             let project = createProject(from: draft, transcript: transcript, recording: recording)
+            guard let project else {
+                lastErrorMessage = "Capture could not be saved."
+                IdeaForgeLog.recording.error("Capture failed because workspace persistence failed")
+                return nil
+            }
             IdeaForgeLog.recording.info("Capture completed from \(draft.source.rawValue, privacy: .public); queued uploads: \(self.activeUploadJobs.count, privacy: .public)")
             return project
         } catch {
@@ -3670,6 +3905,7 @@ public struct SyncHealth: Codable, Hashable, Sendable {
     public var queuedUploads: Int
     public var lastSuccessfulSync: Date
     public var lastRemoteWorkspaceUpdatedAt: Date?
+    public var lastPublishedLocalUpdatedAt: Date?
     public var lastActivity: WorkspaceSyncActivityReceipt?
     public var failingItems: Int
     public var syncConflictStatus: WorkspaceSyncConflictStatus?
@@ -3679,6 +3915,7 @@ public struct SyncHealth: Codable, Hashable, Sendable {
         queuedUploads: Int,
         lastSuccessfulSync: Date,
         lastRemoteWorkspaceUpdatedAt: Date? = nil,
+        lastPublishedLocalUpdatedAt: Date? = nil,
         lastActivity: WorkspaceSyncActivityReceipt? = nil,
         failingItems: Int,
         syncConflictStatus: WorkspaceSyncConflictStatus? = nil
@@ -3687,6 +3924,7 @@ public struct SyncHealth: Codable, Hashable, Sendable {
         self.queuedUploads = queuedUploads
         self.lastSuccessfulSync = lastSuccessfulSync
         self.lastRemoteWorkspaceUpdatedAt = lastRemoteWorkspaceUpdatedAt
+        self.lastPublishedLocalUpdatedAt = lastPublishedLocalUpdatedAt
         self.lastActivity = lastActivity
         self.failingItems = failingItems
         self.syncConflictStatus = syncConflictStatus

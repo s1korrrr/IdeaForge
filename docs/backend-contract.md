@@ -340,9 +340,12 @@ an authorization substitute.
 
 Returns the current workspace snapshot for the configured workspace. Clients may
 include `since=<iso8601-date>` for efficient production implementations, but the
-mock backend currently returns the full scoped snapshot. The app applies only
-newer remote snapshots and fails closed when the remote state would overwrite
-protected local upload work, recordings, or reviewed project content.
+mock backend currently returns the full scoped snapshot. `since` is the last
+remote revision the client fetched or accepted, not the client's local workspace
+clock. The app validates identifiers and relationships before applying only
+newer remote snapshots. Non-overlapping local and remote projects are merged and
+published in the same synchronization pass; concurrent edits to the same
+project stop for explicit review.
 
 ## `PUT /v1/workspace/snapshot`
 
@@ -360,13 +363,24 @@ Content-Type: application/json
 Accept: application/json
 ```
 
-The request body is a complete `WorkspaceState` encoded as JSON. The client sends
-`X-IdeaForge-Base-Remote-Updated-At` when it has previously fetched or accepted a
-remote revision. Production backends must compare that value to the current
-stored workspace revision and return `409` or `412` when another device has
-published a newer snapshot. On stale-base rejection, the app fetches the current
-remote snapshot and enters the same review-before-merge conflict flow instead of
-silently overwriting either side.
+The request body is the shared portion of `WorkspaceState` encoded as JSON. Before
+encoding, clients remove device-local audio paths and upload jobs and reset local
+reachability, queue, activity, failure, conflict, and publish-receipt fields.
+Recording object keys and shared processing state remain in the payload; a local
+file status is represented as uploaded when an object key exists and missing
+otherwise. A client applying the response restores matching audio paths, file
+statuses, upload jobs, and local health fields from its own persisted state.
+
+Clients pull before push and send `X-IdeaForge-Base-Remote-Updated-At` when they
+have previously fetched or accepted a remote revision. Production backends must
+compare that value to the current stored workspace revision and return `409` or
+`412` when another device has published a newer snapshot. On stale-base
+rejection, the app fetches the current remote snapshot and enters the same
+review-before-merge conflict flow instead of silently overwriting either side.
+The client records both the server's accepted revision and the local
+`WorkspaceState.updatedAt` that was sent; a local edit made while the request is
+in flight therefore remains eligible for a later publish even if the server
+assigns a newer timestamp.
 
 Successful response:
 

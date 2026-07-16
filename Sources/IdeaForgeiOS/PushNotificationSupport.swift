@@ -18,6 +18,27 @@ private final class BackgroundSessionCompletionHandler: @unchecked Sendable {
 }
 
 @MainActor
+final class BackgroundUploadEventCenter {
+    static let shared = BackgroundUploadEventCenter()
+
+    private var handler: (@MainActor () async -> Void)?
+
+    private init() {}
+
+    func install(_ handler: @escaping @MainActor () async -> Void) {
+        self.handler = handler
+    }
+
+    func handleEventsFinished() async {
+        guard let handler else {
+            IdeaForgeLog.sync.error("Background upload events finished before reconciliation handler installation")
+            return
+        }
+        await handler()
+    }
+}
+
+@MainActor
 final class PushNotificationTokenCenter: ObservableObject {
     static let shared = PushNotificationTokenCenter()
 
@@ -69,7 +90,8 @@ final class IdeaForgePushNotificationAppDelegate: NSObject, UIApplicationDelegat
         }
         let completion = BackgroundSessionCompletionHandler(completionHandler)
         URLSessionHTTPDataTransport.shared.installBackgroundEventsCompletionHandler {
-            DispatchQueue.main.async {
+            Task { @MainActor in
+                await BackgroundUploadEventCenter.shared.handleEventsFinished()
                 completion()
             }
         }
@@ -107,26 +129,34 @@ final class IdeaForgePushNotificationAppDelegate: NSObject, UIApplicationDelegat
 }
 
 enum PushNotificationAuthorizationRequester {
-    static func authorizeAndRequestDeviceToken() async throws -> Bool {
+    static func authorizeAndRequestDeviceToken() async throws -> RemoteNotificationAlertAuthorizationState {
         let center = UNUserNotificationCenter.current()
         let settings = await center.notificationSettings()
+        let initialState: RemoteNotificationAlertAuthorizationState
 
         switch settings.authorizationStatus {
         case .authorized, .provisional, .ephemeral:
-            break
+            initialState = .authorized
         case .notDetermined:
-            let granted = try await center.requestAuthorization(options: [.alert, .badge, .sound])
-            guard granted else { return false }
+            initialState = .notDetermined
         case .denied:
-            return false
+            initialState = .denied
         @unknown default:
-            return false
+            initialState = .denied
         }
 
-        await MainActor.run {
-            UIApplication.shared.registerForRemoteNotifications()
+        let plan = RemoteNotificationRegistrationPolicy.plan(for: initialState)
+        var finalState = initialState
+        if plan.shouldRequestAlertAuthorization {
+            let granted = try await center.requestAuthorization(options: [.alert, .badge, .sound])
+            finalState = granted ? .authorized : .denied
         }
-        return true
+        if plan.shouldRegisterForRemoteNotifications {
+            await MainActor.run {
+                UIApplication.shared.registerForRemoteNotifications()
+            }
+        }
+        return finalState
     }
 }
 #endif
