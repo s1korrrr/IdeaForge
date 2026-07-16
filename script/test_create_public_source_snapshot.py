@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from pathlib import Path
 import shlex
@@ -53,6 +52,8 @@ class PublicSourceSnapshotTests(unittest.TestCase):
         self.git("config", "user.name", "Private Fixture")
         self.git("config", "user.email", "private-fixture@example.test")
         self.write("README.md", "# Fixture\n")
+        self.write("PUBLIC_SOURCE_AUDIT.json", '{"status":"stale"}\n')
+        self.write("PUBLIC_SOURCE_AUDIT.md", "# Stale generated audit\n")
         self.write("Sources/App.swift", "struct App {}\n")
         image = b"build-critical-icon"
         self.write("Sources/IdeaForgeAssets/icon.png", image)
@@ -133,9 +134,14 @@ class PublicSourceSnapshotTests(unittest.TestCase):
         for path in excluded:
             self.assertFalse((self.destination / path).exists(), path)
 
-        report = json.loads((self.destination / "PUBLIC_SOURCE_AUDIT.json").read_text(encoding="utf-8"))
-        self.assertEqual(report["status"], "pass")
-        self.assertEqual(report["finding_count"], 0)
+        self.assertFalse((self.destination / "PUBLIC_SOURCE_AUDIT.json").exists())
+        self.assertFalse((self.destination / "PUBLIC_SOURCE_AUDIT.md").exists())
+        tracked_paths = set(
+            self.git("ls-tree", "-r", "--name-only", "HEAD", cwd=self.destination).stdout.splitlines()
+        )
+        self.assertNotIn("PUBLIC_SOURCE_AUDIT.json", tracked_paths)
+        self.assertNotIn("PUBLIC_SOURCE_AUDIT.md", tracked_paths)
+        self.assertIn("Public-source audit: PASS", result.stderr)
 
     def test_rejects_dirty_source(self) -> None:
         self.create_fixture_repository()
@@ -217,11 +223,32 @@ class PublicSourceSnapshotTests(unittest.TestCase):
         self.write("Sources/Leak.txt", private_path)
         self.git("add", "-A")
         self.git("commit", "-m", "add privacy leak")
+        fake_bin = self.temporary_root / "fake-init-bin"
+        fake_bin.mkdir()
+        init_log = self.temporary_root / "git-init.log"
+        fake_git = fake_bin / "git"
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        fake_git.write_text(
+            "#!/bin/sh\n"
+            'for argument in "$@"; do\n'
+            '  if [ "$argument" = "init" ]; then\n'
+            f"    printf 'init\\n' >> {shlex.quote(str(init_log))}\n"
+            "    break\n"
+            "  fi\n"
+            "done\n"
+            f"exec {shlex.quote(real_git)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
 
-        result = self.run_snapshot()
+        result = self.run_snapshot(environment=environment)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("public-source audit", result.stderr.lower())
+        self.assertFalse(init_log.exists(), "git init ran before the public-source audit passed")
         self.assertFalse(self.destination.exists())
 
 

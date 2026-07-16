@@ -131,6 +131,8 @@ archive_paths=(
   ":(exclude,glob)**/.DS_Store"
   ":(exclude,glob)**/__pycache__/**"
   ":(exclude,glob)**/*.pyc"
+  ":(exclude)PUBLIC_SOURCE_AUDIT.json"
+  ":(exclude)PUBLIC_SOURCE_AUDIT.md"
   ":(exclude)docs/app-store-release-checklist.md"
   ":(exclude)docs/audits" ":(exclude)docs/audits/**"
   ":(exclude)docs/e2e-ship-audit-2026-07-10.md"
@@ -152,10 +154,13 @@ ARCHIVE_FILE=""
 [[ ! -e "$STAGING/.git" ]] || fail "archive unexpectedly contains Git metadata"
 [[ -f "$STAGING/script/audit_public_source.py" ]] || fail "snapshot is missing its audit tool"
 
+AUDIT_JSON="$STAGING/.public-source-audit.json"
+AUDIT_MARKDOWN="$STAGING/.public-source-audit.md"
 python3 "$STAGING/script/audit_public_source.py" "$STAGING" \
   --profile public \
-  --json-out "$STAGING/PUBLIC_SOURCE_AUDIT.json" \
-  --markdown-out "$STAGING/PUBLIC_SOURCE_AUDIT.md"
+  --json-out "$AUDIT_JSON" \
+  --markdown-out "$AUDIT_MARKDOWN"
+rm -f "$AUDIT_JSON" "$AUDIT_MARKDOWN"
 
 # Auditing must complete before this point. The public repository intentionally
 # uses a new non-personal identity and contains none of the source Git objects.
