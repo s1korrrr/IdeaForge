@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from pathlib import Path
 import shlex
@@ -53,6 +52,8 @@ class PublicSourceSnapshotTests(unittest.TestCase):
         self.git("config", "user.name", "Private Fixture")
         self.git("config", "user.email", "private-fixture@example.test")
         self.write("README.md", "# Fixture\n")
+        self.write("PUBLIC_SOURCE_AUDIT.json", '{"status":"stale"}\n')
+        self.write("PUBLIC_SOURCE_AUDIT.md", "# Stale generated audit\n")
         self.write("Sources/App.swift", "struct App {}\n")
         image = b"build-critical-icon"
         self.write("Sources/IdeaForgeAssets/icon.png", image)
@@ -133,9 +134,14 @@ class PublicSourceSnapshotTests(unittest.TestCase):
         for path in excluded:
             self.assertFalse((self.destination / path).exists(), path)
 
-        report = json.loads((self.destination / "PUBLIC_SOURCE_AUDIT.json").read_text(encoding="utf-8"))
-        self.assertEqual(report["status"], "pass")
-        self.assertEqual(report["finding_count"], 0)
+        self.assertFalse((self.destination / "PUBLIC_SOURCE_AUDIT.json").exists())
+        self.assertFalse((self.destination / "PUBLIC_SOURCE_AUDIT.md").exists())
+        tracked_paths = set(
+            self.git("ls-tree", "-r", "--name-only", "HEAD", cwd=self.destination).stdout.splitlines()
+        )
+        self.assertNotIn("PUBLIC_SOURCE_AUDIT.json", tracked_paths)
+        self.assertNotIn("PUBLIC_SOURCE_AUDIT.md", tracked_paths)
+        self.assertIn("Public-source audit: PASS", result.stderr)
 
     def test_rejects_dirty_source(self) -> None:
         self.create_fixture_repository()
