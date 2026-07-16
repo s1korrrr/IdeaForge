@@ -1350,6 +1350,13 @@ struct SettingsView: View {
 
     private func syncBackendWorkspace() {
         guard !isSyncingWorkspace else { return }
+        if case .blocked(_, let message) = WorkspaceAutoSyncPolicy.localPreflightDecision(
+            for: store.workspaceState()
+        ) {
+            backendStatusMessage = message
+            IdeaForgeLog.sync.warning("macOS workspace backend sync skipped; local publication policy blocked action")
+            return
+        }
         let capabilityDecision = backendCapabilityDecision(requiredCapabilities: [.syncWorkspace])
         guard capabilityDecision.isAllowed else {
             backendStatusMessage = "Workspace sync needs validated backend capability. \(capabilityDecision.blockerSummary)"
@@ -1369,9 +1376,15 @@ struct SettingsView: View {
                 let engine = WorkspaceSyncEngine(
                     client: BackendWorkspaceSyncClient(configuration: configuration)
                 )
-                let summary = try await engine.pushLocalSnapshot(from: store)
-                backendStatusMessage = summary.pushedLocalSnapshot ? "Local workspace published to backend." : "Workspace already up to date."
-                IdeaForgeLog.sync.info("macOS workspace backend sync completed; pushed local snapshot: \(summary.pushedLocalSnapshot, privacy: .public)")
+                let summary = try await engine.synchronize(store: store)
+                if summary.appliedRemoteSnapshot {
+                    backendStatusMessage = "Latest backend workspace loaded on this Mac."
+                } else if summary.pushedLocalSnapshot {
+                    backendStatusMessage = "Local workspace published to backend."
+                } else {
+                    backendStatusMessage = "Workspace already up to date."
+                }
+                IdeaForgeLog.sync.info("macOS workspace backend sync completed; fetched: \(summary.fetched, privacy: .public), applied remote: \(summary.appliedRemoteSnapshot, privacy: .public), pushed local: \(summary.pushedLocalSnapshot, privacy: .public)")
             } catch BackendConfigurationError.invalidBaseURL {
                 backendStatusMessage = "Enter a valid https:// backend URL."
                 IdeaForgeLog.sync.error("macOS workspace backend sync failed; invalid backend URL")
@@ -1412,11 +1425,15 @@ struct SettingsView: View {
                 )
                 if let conflict = store.syncHealth.syncConflictStatus, !conflict.reviewItems.isEmpty {
                     let selection = reviewedMergeSelection(for: conflict)
-                    _ = try await engine.pullLatestApplyingReviewedMerge(into: store, selection: selection)
-                    backendStatusMessage = "Workspace merged with reviewed local choices."
+                    let summary = try await engine.pullLatestApplyingReviewedMerge(into: store, selection: selection)
+                    backendStatusMessage = summary.pushedLocalSnapshot
+                        ? "Workspace merged with reviewed local choices and published."
+                        : "Workspace merged with reviewed local choices."
                 } else {
-                    _ = try await engine.pullLatestPreservingLocalUploadWork(into: store)
-                    backendStatusMessage = "Workspace merged while preserving local upload work."
+                    let summary = try await engine.pullLatestPreservingLocalUploadWork(into: store)
+                    backendStatusMessage = summary.pushedLocalSnapshot
+                        ? "Workspace merged while preserving local upload work and published."
+                        : "Workspace merged while preserving local upload work."
                 }
                 IdeaForgeLog.sync.info("macOS workspace conflict merge completed")
             } catch BackendConfigurationError.invalidBaseURL {

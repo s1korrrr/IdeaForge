@@ -52,6 +52,23 @@ public struct WorkspaceState: Codable, Equatable, Sendable {
         let store = SampleData.store()
         return store.workspaceState()
     }
+
+    public static func fresh() -> WorkspaceState {
+        WorkspaceState(
+            projects: [],
+            workflowTemplates: DefaultWorkflows.templates,
+            uploadJobs: [],
+            privacyMode: .privateLocal,
+            syncHealth: SyncHealth(
+                watchReachable: false,
+                queuedUploads: 0,
+                lastSuccessfulSync: .distantPast,
+                failingItems: 0
+            ),
+            selectedProjectID: nil,
+            updatedAt: .distantPast
+        )
+    }
 }
 
 public enum WorkspaceRepositoryError: Error, Equatable {

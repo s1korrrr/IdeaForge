@@ -7,7 +7,7 @@ struct WatchCaptureView: View {
     @State private var selectedTag: IdeaTag = .appIdea
     @State private var captureTargetID = Self.newIdeaTargetID
     @State private var recorder = LocalAudioRecorder()
-    @State private var transferService = RecordingTransferServiceFactory.platformDefault()
+    let transferService: any RecordingTransferService
     @State private var transferStatus = RecordingTransferStatus.unavailable
     @State private var transferFailureMessage: String?
     @State private var voiceLevel = 0.0
@@ -232,15 +232,22 @@ struct WatchCaptureView: View {
             }
             .navigationTitle("")
             .onAppear {
+                transferService.setReachabilityHandler { isReachable in
+                    store.syncHealth.watchReachable = isReachable
+                }
                 transferService.setTransferCompletionHandler { recordingID, imported in
                     if imported {
-                        transferStatus = .received
-                        transferFailureMessage = nil
-                        store.markRecordingTransferredToIPhone(recordingID: recordingID)
+                        if store.markRecordingTransferredToIPhone(recordingID: recordingID) {
+                            transferStatus = .received
+                            transferFailureMessage = nil
+                        } else {
+                            transferStatus = .failed
+                            transferFailureMessage = "iPhone imported this clip, but Watch could not save the receipt. Retry to confirm it."
+                        }
                     } else {
                         transferStatus = .failed
                         transferFailureMessage = "iPhone did not import this clip. Retry when both devices are ready."
-                        store.markRecordingWatchTransferFailed(recordingID: recordingID)
+                        _ = store.markRecordingWatchTransferFailed(recordingID: recordingID)
                     }
                 }
                 transferService.activate()

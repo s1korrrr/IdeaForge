@@ -74,6 +74,7 @@ DESTINATION="$DESTINATION_PARENT/$DESTINATION_NAME"
 [[ ! -e "$DESTINATION" ]] || fail "destination already exists: $DESTINATION"
 
 TREE_LISTING="$(mktemp "$DESTINATION_PARENT/.ideaforge-public-tree.XXXXXX")"
+ARCHIVE_FILE=""
 STAGING=""
 cleanup() {
   if [[ -n "${TREE_LISTING:-}" && -f "$TREE_LISTING" ]]; then
@@ -81,6 +82,9 @@ cleanup() {
   fi
   if [[ -n "${STAGING:-}" && -d "$STAGING" ]]; then
     rm -rf "$STAGING"
+  fi
+  if [[ -n "${ARCHIVE_FILE:-}" && -f "$ARCHIVE_FILE" ]]; then
+    rm -f "$ARCHIVE_FILE"
   fi
 }
 trap cleanup EXIT INT TERM
@@ -139,7 +143,11 @@ archive_paths=(
   ":(exclude,glob)docs/swiftui-polish-audit-*.md"
 )
 
-git -C "$SOURCE_ROOT" archive --format=tar HEAD -- "${archive_paths[@]}" | tar -xf - -C "$STAGING"
+ARCHIVE_FILE="$(mktemp "$DESTINATION_PARENT/.ideaforge-public-archive.XXXXXX")"
+git -C "$SOURCE_ROOT" archive --format=tar --output="$ARCHIVE_FILE" HEAD -- "${archive_paths[@]}"
+tar -xf "$ARCHIVE_FILE" -C "$STAGING"
+rm -f "$ARCHIVE_FILE"
+ARCHIVE_FILE=""
 
 [[ ! -e "$STAGING/.git" ]] || fail "archive unexpectedly contains Git metadata"
 [[ -f "$STAGING/script/audit_public_source.py" ]] || fail "snapshot is missing its audit tool"

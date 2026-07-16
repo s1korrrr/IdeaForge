@@ -182,17 +182,24 @@ public struct SystemSpeechAudioTranscriber: LocalSpeechAudioTranscribing {
         request.shouldReportPartialResults = false
         request.requiresOnDeviceRecognition = false
 
-        return try await withCheckedThrowingContinuation { continuation in
-            let box = SpeechRecognitionContinuationBox(continuation: continuation)
-            box.task = recognizer.recognitionTask(with: request) { result, error in
-                if let error {
-                    box.finish(.failure(error))
-                    return
-                }
+        let holder = SpeechRecognitionContinuationHolder()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let box = SpeechRecognitionContinuationBox(continuation: continuation)
+                holder.install(box)
+                let task = recognizer.recognitionTask(with: request) { result, error in
+                    if let error {
+                        box.finish(.failure(error))
+                        return
+                    }
 
-                guard let result, result.isFinal else { return }
-                box.finish(.success(result.bestTranscription.formattedString))
+                    guard let result, result.isFinal else { return }
+                    box.finish(.success(result.bestTranscription.formattedString))
+                }
+                box.install(task: task)
             }
+        } onCancel: {
+            holder.cancel()
         }
     }
 }
@@ -200,10 +207,21 @@ public struct SystemSpeechAudioTranscriber: LocalSpeechAudioTranscribing {
 private final class SpeechRecognitionContinuationBox: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<String, Error>?
-    var task: SFSpeechRecognitionTask?
+    private var task: SFSpeechRecognitionTask?
 
     init(continuation: CheckedContinuation<String, Error>) {
         self.continuation = continuation
+    }
+
+    func install(task: SFSpeechRecognitionTask) {
+        lock.lock()
+        guard continuation != nil else {
+            lock.unlock()
+            task.cancel()
+            return
+        }
+        self.task = task
+        lock.unlock()
     }
 
     func finish(_ result: Result<String, Error>) {
@@ -217,6 +235,32 @@ private final class SpeechRecognitionContinuationBox: @unchecked Sendable {
         guard let continuation else { return }
         task?.cancel()
         continuation.resume(with: result)
+    }
+}
+
+private final class SpeechRecognitionContinuationHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var box: SpeechRecognitionContinuationBox?
+    private var isCancelled = false
+
+    func install(_ box: SpeechRecognitionContinuationBox) {
+        lock.lock()
+        if isCancelled {
+            lock.unlock()
+            box.finish(.failure(CancellationError()))
+            return
+        }
+        self.box = box
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let box = box
+        self.box = nil
+        lock.unlock()
+        box?.finish(.failure(CancellationError()))
     }
 }
 #else

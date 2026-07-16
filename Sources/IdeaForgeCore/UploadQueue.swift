@@ -600,6 +600,50 @@ public protocol HTTPDataTransport: Sendable {
     func uploadFile(for request: URLRequest, from sourceURL: URL) async throws -> (Data, HTTPURLResponse)
 }
 
+public struct BackgroundUploadCompletionRecord: Codable, Equatable, Sendable {
+    public var uploadJobID: String
+    public var recordingID: String
+    public var responseData: Data
+    public var statusCode: Int?
+    public var errorDescription: String?
+    public var completedAt: Date
+
+    public init(
+        uploadJobID: String,
+        recordingID: String,
+        responseData: Data,
+        statusCode: Int?,
+        errorDescription: String?,
+        completedAt: Date
+    ) {
+        self.uploadJobID = uploadJobID
+        self.recordingID = recordingID
+        self.responseData = responseData
+        self.statusCode = statusCode
+        self.errorDescription = errorDescription
+        self.completedAt = completedAt
+    }
+}
+
+public enum BackgroundUploadCompletionPolicy {
+    public static func receipt(from record: BackgroundUploadCompletionRecord) throws -> UploadReceipt {
+        if let errorDescription = record.errorDescription {
+            throw UploadClientError.uploadFailed(errorDescription)
+        }
+        guard let statusCode = record.statusCode else {
+            throw UploadClientError.invalidResponse
+        }
+        guard (200..<300).contains(statusCode) else {
+            throw UploadClientError.httpStatus(statusCode)
+        }
+        let decoded = try JSONDecoder().decode(BackendUploadResponse.self, from: record.responseData)
+        guard !decoded.objectKey.isEmpty else {
+            throw UploadClientError.invalidResponse
+        }
+        return UploadReceipt(recordingID: record.recordingID, objectKey: decoded.objectKey)
+    }
+}
+
 public final class URLSessionHTTPDataTransport: NSObject, HTTPDataTransport, @unchecked Sendable {
     public static let backgroundSessionIdentifier = "com.s1kor.ideaforge.audio-upload"
     public static let shared = URLSessionHTTPDataTransport()
@@ -611,7 +655,9 @@ public final class URLSessionHTTPDataTransport: NSObject, HTTPDataTransport, @un
 
     private let lock = NSLock()
     private var transferStates: [Int: TransferState] = [:]
+    private var orphanResponseData: [Int: Data] = [:]
     private var backgroundEventsCompletionHandler: (@Sendable () -> Void)?
+    private let completionRecordsKey = "ideaforge.backgroundUpload.completionRecords.v1"
     private lazy var session: URLSession = {
         let configuration: URLSessionConfiguration
         #if os(iOS)
@@ -643,6 +689,7 @@ public final class URLSessionHTTPDataTransport: NSObject, HTTPDataTransport, @un
 
         return try await withCheckedThrowingContinuation { continuation in
             let task = session.uploadTask(with: request, fromFile: sourceURL)
+            task.taskDescription = request.value(forHTTPHeaderField: "X-IdeaForge-Upload-Job-ID")
             lock.lock()
             transferStates[task.taskIdentifier] = TransferState(continuation: continuation)
             lock.unlock()
@@ -657,18 +704,42 @@ public final class URLSessionHTTPDataTransport: NSObject, HTTPDataTransport, @un
         _ = session
     }
 
+    public func pendingBackgroundCompletionRecords() -> [BackgroundUploadCompletionRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        return loadCompletionRecordsLocked()
+    }
+
+    public func removeBackgroundCompletionRecords(uploadJobIDs: Set<String>) {
+        guard !uploadJobIDs.isEmpty else { return }
+        lock.lock()
+        let remaining = loadCompletionRecordsLocked().filter {
+            !uploadJobIDs.contains($0.uploadJobID)
+        }
+        saveCompletionRecordsLocked(remaining)
+        lock.unlock()
+    }
+
     private func append(_ data: Data, to taskIdentifier: Int) {
         lock.lock()
-        transferStates[taskIdentifier]?.responseData.append(data)
+        if transferStates[taskIdentifier] != nil {
+            transferStates[taskIdentifier]?.responseData.append(data)
+        } else {
+            orphanResponseData[taskIdentifier, default: Data()].append(data)
+        }
         lock.unlock()
     }
 
     private func finish(task: URLSessionTask, error: Error?) {
         lock.lock()
         let state = transferStates.removeValue(forKey: task.taskIdentifier)
+        let orphanData = orphanResponseData.removeValue(forKey: task.taskIdentifier) ?? Data()
         lock.unlock()
 
-        guard let state else { return }
+        guard let state else {
+            persistBackgroundCompletion(task: task, responseData: orphanData, error: error)
+            return
+        }
         if let error {
             state.continuation.resume(throwing: error)
             return
@@ -678,6 +749,57 @@ public final class URLSessionHTTPDataTransport: NSObject, HTTPDataTransport, @un
             return
         }
         state.continuation.resume(returning: (state.responseData, response))
+    }
+
+    private func persistBackgroundCompletion(
+        task: URLSessionTask,
+        responseData: Data,
+        error: Error?
+    ) {
+        let request = task.originalRequest ?? task.currentRequest
+        let uploadJobID = request?.value(forHTTPHeaderField: "X-IdeaForge-Upload-Job-ID")
+            ?? task.taskDescription
+            ?? ""
+        let recordingID = request?.value(forHTTPHeaderField: "X-IdeaForge-Recording-ID") ?? ""
+        guard !uploadJobID.isEmpty, !recordingID.isEmpty else {
+            IdeaForgeLog.sync.error("Background upload completion could not be reconciled; task metadata missing")
+            return
+        }
+
+        let record = BackgroundUploadCompletionRecord(
+            uploadJobID: uploadJobID,
+            recordingID: recordingID,
+            responseData: responseData,
+            statusCode: (task.response as? HTTPURLResponse)?.statusCode,
+            errorDescription: error.map { String(describing: $0) },
+            completedAt: Date()
+        )
+        lock.lock()
+        var records = loadCompletionRecordsLocked()
+        records.removeAll { $0.uploadJobID == uploadJobID }
+        records.append(record)
+        saveCompletionRecordsLocked(records)
+        lock.unlock()
+        IdeaForgeLog.sync.info("Background upload completion persisted for relaunch reconciliation")
+    }
+
+    private func loadCompletionRecordsLocked() -> [BackgroundUploadCompletionRecord] {
+        guard let data = UserDefaults.standard.data(forKey: completionRecordsKey) else {
+            return []
+        }
+        return (try? JSONDecoder().decode([BackgroundUploadCompletionRecord].self, from: data)) ?? []
+    }
+
+    private func saveCompletionRecordsLocked(_ records: [BackgroundUploadCompletionRecord]) {
+        if records.isEmpty {
+            UserDefaults.standard.removeObject(forKey: completionRecordsKey)
+            return
+        }
+        guard let data = try? JSONEncoder().encode(records) else {
+            IdeaForgeLog.sync.error("Background upload completion persistence encoding failed")
+            return
+        }
+        UserDefaults.standard.set(data, forKey: completionRecordsKey)
     }
 
     private func finishBackgroundEvents() {
@@ -773,7 +895,7 @@ public struct BackendAudioUploadClient: AudioUploadClient {
     }
 }
 
-private struct BackendUploadResponse: Decodable {
+struct BackendUploadResponse: Decodable {
     var objectKey: String
 }
 
@@ -889,13 +1011,23 @@ public struct UploadQueueProcessor: Sendable {
         var summary = UploadQueueProcessingSummary()
         for job in dueJobs {
             summary.attemptedCount += 1
-            store.markUploadStarted(recordingID: job.recordingID, now: now)
+            guard store.markUploadStarted(recordingID: job.recordingID, now: now) else {
+                summary.failedCount += 1
+                continue
+            }
 
             let uploadJob = store.uploadJobs.first { $0.recordingID == job.recordingID } ?? job
             do {
                 let receipt = try await client.upload(job: uploadJob)
-                store.markUploadSucceeded(recordingID: receipt.recordingID, objectKey: receipt.objectKey, now: now)
-                summary.uploadedCount += 1
+                if store.markUploadSucceeded(
+                    recordingID: receipt.recordingID,
+                    objectKey: receipt.objectKey,
+                    now: now
+                ) {
+                    summary.uploadedCount += 1
+                } else {
+                    summary.failedCount += 1
+                }
             } catch {
                 let message = (error as? UserFacingIdeaForgeError)?.userFacingMessage ?? String(describing: error)
                 store.markUploadFailed(
@@ -931,6 +1063,10 @@ public struct ConfiguredUploadQueueProcessor: Sendable {
         let configuration: BackendUploadConfiguration?
         do {
             configuration = try backendConfigurationManager.resolvedUploadConfiguration()
+            let settings = try backendConfigurationManager.loadSettings()
+            if settings.isEnabled, configuration == nil {
+                throw BackendConfigurationError.missingRequiredConfiguration
+            }
         } catch {
             _ = await UploadQueueProcessor(
                 client: ImmediateUploadFailureClient(error: .configurationUnavailable),

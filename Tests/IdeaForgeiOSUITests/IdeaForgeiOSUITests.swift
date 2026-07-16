@@ -771,6 +771,16 @@ final class IdeaForgeiOSUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Recording Inbox"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.alerts["IdeaForge needs attention"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["Remote notification result: Failed."].exists)
+        app.alerts.buttons["OK"].tap()
+
+        relaunch(with: [
+            "-uiTestingQueuedUpload",
+            "-uiTestingInvalidUploadConfiguration",
+            "-uiTestingRunColdRemoteNotification"
+        ])
+        XCTAssertTrue(app.navigationBars["Recording Inbox"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.alerts["IdeaForge needs attention"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Cold-launch remote notification result: Failed."].exists)
     }
 
     func testRecordingPermissionDeniedShowsVisibleError() {

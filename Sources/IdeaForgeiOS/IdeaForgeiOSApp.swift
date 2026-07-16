@@ -11,11 +11,82 @@ struct IdeaForgeiOSApp: App {
     @State private var didRunBackgroundCallerProbe = false
     @Environment(\.scenePhase) private var scenePhase
     private let backendConfigurationManager: BackendConfigurationManager
+    private let recordingTransferService: any RecordingTransferService
 
     init() {
-        _store = State(initialValue: Self.makeStore())
-        _uploadProcessingCoordinator = State(initialValue: UploadQueueProcessingCoordinator())
-        backendConfigurationManager = Self.makeBackendConfigurationManager()
+        let store = Self.makeStore()
+        let uploadProcessingCoordinator = UploadQueueProcessingCoordinator()
+        let backendConfigurationManager = Self.makeBackendConfigurationManager()
+        _store = State(initialValue: store)
+        _uploadProcessingCoordinator = State(initialValue: uploadProcessingCoordinator)
+        self.backendConfigurationManager = backendConfigurationManager
+
+        let importer = TransferredRecordingImporter()
+        let recordingTransferService: any RecordingTransferService
+        if ProcessInfo.processInfo.arguments.contains("-uiTesting") {
+            recordingTransferService = UnavailableRecordingTransferService()
+        } else {
+            recordingTransferService = RecordingTransferServiceFactory.platformDefault { fileURL, metadata in
+                do {
+                    try await importer.importFile(
+                        sourceURL: fileURL,
+                        metadata: metadata,
+                        into: store
+                    )
+                    let backgroundCoordinator = BackgroundUploadCoordinator(
+                        store: store,
+                        backendConfigurationManager: backendConfigurationManager,
+                        uploadProcessingCoordinator: uploadProcessingCoordinator
+                    )
+                    backgroundCoordinator.scheduleIfNeeded()
+                    Task { @MainActor in
+                        _ = await backgroundCoordinator.runRefresh()
+                    }
+                    IdeaForgeLog.sync.info("Watch recording transfer imported and downstream sync scheduled")
+                    return .imported
+                } catch {
+                    store.lastErrorMessage = (error as? UserFacingIdeaForgeError)?.userFacingMessage ?? "Watch transfer import failed."
+                    IdeaForgeLog.sync.error("Watch recording transfer import failed")
+                    return .failed
+                }
+            }
+        }
+        self.recordingTransferService = recordingTransferService
+        BackgroundUploadEventCenter.shared.install {
+            let coordinator = BackgroundUploadCoordinator(
+                store: store,
+                backendConfigurationManager: backendConfigurationManager,
+                uploadProcessingCoordinator: uploadProcessingCoordinator
+            )
+            _ = await coordinator.runRefresh()
+        }
+        PushNotificationTokenCenter.shared.installRemoteNotificationHandler { trigger in
+            let coordinator = BackgroundUploadCoordinator(
+                store: store,
+                backendConfigurationManager: backendConfigurationManager,
+                uploadProcessingCoordinator: uploadProcessingCoordinator
+            )
+            return await coordinator.runRemoteNotification(trigger: trigger)
+        }
+        if ProcessInfo.processInfo.arguments.contains("-uiTestingRunColdRemoteNotification") {
+            Task { @MainActor in
+                let result = await PushNotificationTokenCenter.shared.handleRemoteNotification(
+                    .accepted(
+                        RemotePushNotificationTrigger(
+                            workspaceID: "workspace_alpha",
+                            topics: [.recordingProcessing]
+                        )
+                    )
+                )
+                store.lastErrorMessage = result == .failed
+                    ? "Cold-launch remote notification result: Failed."
+                    : "Cold-launch remote notification handler was ready."
+            }
+        }
+        recordingTransferService.setReachabilityHandler { isReachable in
+            store.syncHealth.watchReachable = isReachable
+        }
+        recordingTransferService.activate()
     }
 
     var body: some Scene {
@@ -29,9 +100,8 @@ struct IdeaForgeiOSApp: App {
             .preferredColorScheme(Self.uiTestingPreferredColorScheme)
             .onAppear {
                 IdeaForgeLog.lifecycle.info("iOS app appeared")
-                pushNotificationTokenCenter.installRemoteNotificationHandler { trigger in
-                    await backgroundUploadCoordinator.runRemoteNotification(trigger: trigger)
-                }
+                recordingTransferService.activate()
+                backgroundUploadCoordinator.reconcileCompletedBackgroundUploads()
                 backgroundUploadCoordinator.scheduleIfNeeded()
                 runBackgroundCallerProbeIfRequested()
             }

@@ -41,6 +41,7 @@ struct BackgroundUploadCoordinator {
         }
 
         do {
+            _ = reconcileCompletedBackgroundUploads(now: now)
             _ = try await processUploadsAndPublishIfReady(now: now)
             IdeaForgeLog.sync.info("Background upload refresh completed")
             return .completed
@@ -49,6 +50,56 @@ struct BackgroundUploadCoordinator {
             IdeaForgeLog.sync.error("Background upload refresh failed")
             return .failed
         }
+    }
+
+    @discardableResult
+    func reconcileCompletedBackgroundUploads(now: Date = Date()) -> Int {
+        let records = URLSessionHTTPDataTransport.shared.pendingBackgroundCompletionRecords()
+        guard !records.isEmpty else { return 0 }
+
+        var reconciledUploadJobIDs: Set<String> = []
+        for record in records {
+            guard store.uploadJobs.contains(where: {
+                $0.id == record.uploadJobID && $0.recordingID == record.recordingID
+            }) else {
+                if !store.workspaceLoadFailed {
+                    reconciledUploadJobIDs.insert(record.uploadJobID)
+                } else {
+                    IdeaForgeLog.sync.warning("Retained unmatched background upload completion because workspace loading is degraded")
+                }
+                continue
+            }
+
+            do {
+                let receipt = try BackgroundUploadCompletionPolicy.receipt(from: record)
+                if store.markUploadSucceeded(
+                    recordingID: receipt.recordingID,
+                    objectKey: receipt.objectKey,
+                    now: record.completedAt
+                ) {
+                    reconciledUploadJobIDs.insert(record.uploadJobID)
+                }
+            } catch {
+                let message = (error as? UserFacingIdeaForgeError)?.userFacingMessage
+                    ?? "Background upload could not be completed."
+                if store.markUploadFailed(
+                    recordingID: record.recordingID,
+                    message: message,
+                    category: UploadFailureCategory.classify(error),
+                    now: record.completedAt
+                ) {
+                    reconciledUploadJobIDs.insert(record.uploadJobID)
+                }
+            }
+        }
+
+        URLSessionHTTPDataTransport.shared.removeBackgroundCompletionRecords(
+            uploadJobIDs: reconciledUploadJobIDs
+        )
+        if !reconciledUploadJobIDs.isEmpty {
+            IdeaForgeLog.sync.info("Reconciled background upload completions after app relaunch; count: \(reconciledUploadJobIDs.count, privacy: .public)")
+        }
+        return reconciledUploadJobIDs.count
     }
 
     func runRemoteNotification(

@@ -1,5 +1,35 @@
 import Foundation
 
+public enum RemoteNotificationAlertAuthorizationState: Equatable, Sendable {
+    case notDetermined
+    case authorized
+    case denied
+}
+
+public struct RemoteNotificationRegistrationPlan: Equatable, Sendable {
+    public var shouldRequestAlertAuthorization: Bool
+    public var shouldRegisterForRemoteNotifications: Bool
+
+    public init(
+        shouldRequestAlertAuthorization: Bool,
+        shouldRegisterForRemoteNotifications: Bool
+    ) {
+        self.shouldRequestAlertAuthorization = shouldRequestAlertAuthorization
+        self.shouldRegisterForRemoteNotifications = shouldRegisterForRemoteNotifications
+    }
+}
+
+public enum RemoteNotificationRegistrationPolicy {
+    public static func plan(
+        for state: RemoteNotificationAlertAuthorizationState
+    ) -> RemoteNotificationRegistrationPlan {
+        RemoteNotificationRegistrationPlan(
+            shouldRequestAlertAuthorization: state == .notDetermined,
+            shouldRegisterForRemoteNotifications: true
+        )
+    }
+}
+
 public enum BackendPushRegistrationError: Error, Equatable {
     case emptyDeviceToken
     case invalidDeviceToken

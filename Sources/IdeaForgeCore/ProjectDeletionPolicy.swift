@@ -126,3 +126,38 @@ public enum ProjectDeletionPolicy {
         return ProjectDeletionReadiness(projectID: project.id, blockers: blockers)
     }
 }
+
+enum ManagedRecordingFileCleanup {
+    static func defaultDirectory(fileManager: FileManager) -> URL {
+        let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        return base.appending(path: "IdeaForge/Recordings", directoryHint: .isDirectory)
+    }
+
+    static func removeFiles(
+        at paths: Set<String>,
+        within managedDirectory: URL,
+        fileManager: FileManager
+    ) -> Int {
+        let resolvedRoot = managedDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        let rootPath = resolvedRoot.path.hasSuffix("/") ? resolvedRoot.path : resolvedRoot.path + "/"
+        var failureCount = 0
+
+        for path in paths where !path.isEmpty {
+            let candidate = URL(fileURLWithPath: path).standardizedFileURL
+            guard fileManager.fileExists(atPath: candidate.path) else { continue }
+
+            let resolvedCandidate = candidate.resolvingSymlinksInPath()
+            guard resolvedCandidate.path.hasPrefix(rootPath) else { continue }
+
+            do {
+                let values = try candidate.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+                try fileManager.removeItem(at: candidate)
+            } catch {
+                failureCount += 1
+            }
+        }
+        return failureCount
+    }
+}
