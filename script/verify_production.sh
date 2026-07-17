@@ -324,6 +324,17 @@ validate_plists_and_privacy() {
   plutil -extract NSMicrophoneUsageDescription raw Sources/IdeaForgeWatch/Info.plist
   plutil -extract UIBackgroundModes xml1 -o - Sources/IdeaForgeiOS/Info.plist | grep -q '<string>audio</string>'
   plutil -extract WKBackgroundModes xml1 -o - Sources/IdeaForgeWatch/Info.plist | grep -q '<string>audio</string>'
+
+  local privacy_manifest
+  for privacy_manifest in \
+    Sources/IdeaForgeMac/PrivacyInfo.xcprivacy \
+    Sources/IdeaForgeiOS/PrivacyInfo.xcprivacy \
+    Sources/IdeaForgeWatch/PrivacyInfo.xcprivacy; do
+    plutil -extract NSPrivacyAccessedAPITypes xml1 -o - "$privacy_manifest" | grep -q 'NSPrivacyAccessedAPICategoryDiskSpace'
+    plutil -extract NSPrivacyAccessedAPITypes xml1 -o - "$privacy_manifest" | grep -q '<string>E174.1</string>'
+    plutil -extract NSPrivacyAccessedAPITypes xml1 -o - "$privacy_manifest" | grep -q 'NSPrivacyAccessedAPICategoryUserDefaults'
+    plutil -extract NSPrivacyAccessedAPITypes xml1 -o - "$privacy_manifest" | grep -q '<string>CA92.1</string>'
+  done
 }
 
 prepare_ios_ui_baseline() {
@@ -493,7 +504,7 @@ validate_ios_reduce_motion_evidence() {
 capture_verification_input_manifest() {
   local relative_path
   git -C "$ROOT_DIR" ls-files --cached --others --exclude-standard -- \
-    Package.swift project.yml Sources Tests script \
+    Package.swift project.yml README.md Sources Tests script docs .github \
     | LC_ALL=C sort -u \
     | while IFS= read -r relative_path; do
         test -f "$ROOT_DIR/$relative_path"
@@ -646,10 +657,19 @@ run_gate repo task7-verifier-regressions "Task 7 verifier and runtime regression
   "$ROOT_DIR/script/test_verify_production.sh"
 run_gate repo task7-visual-regressions "Task 7 iOS visual-gate regression self-tests" \
   "$ROOT_DIR/script/test_ios_accessibility_matrix.sh"
-run_gate repo app-store-assets "Validate app, privacy, and App Store assets" \
-  "$PYTHON_BIN" "$ROOT_DIR/script/validate_app_store_assets.py" \
-  --json "$ARTIFACT_DIR/app-store-assets.json" \
-  --markdown "$ARTIFACT_DIR/app-store-assets.md"
+if [[ -d "$ROOT_DIR/AppStore" ]]; then
+  run_gate repo app-store-assets "Validate app, privacy, and App Store assets" \
+    "$PYTHON_BIN" "$ROOT_DIR/script/validate_app_store_assets.py" \
+    --json "$ARTIFACT_DIR/app-store-assets.json" \
+    --markdown "$ARTIFACT_DIR/app-store-assets.md"
+else
+  run_gate repo public-source-assets "Validate public-source app and privacy assets" \
+    "$PYTHON_BIN" "$ROOT_DIR/script/validate_app_store_assets.py" --public-source \
+    --json "$ARTIFACT_DIR/app-store-assets.json" \
+    --markdown "$ARTIFACT_DIR/app-store-assets.md"
+  record_nonrun_gate external "Private App Store metadata and screenshots" "NOT RUN" \
+    "The public source snapshot intentionally excludes its private AppStore release package."
+fi
 run_gate repo plist-privacy "Validate plist capabilities and privacy manifests" validate_plists_and_privacy
 run_gate repo swift-test "Run SwiftPM tests" swift test
 
@@ -763,6 +783,7 @@ if [[ "$RUN_IOS_UI_SMOKE_SPLIT" == "1" ]]; then
     testRecordingPermissionDeniedShowsVisibleError
     testRecoveredRecordingCheckpointReturnsToInboxAfterRelaunch
     testProjectDetailExposesTranscriptReviewSurface
+    testIdeasAgentAndQuestionAnswerFlow
   )
   for ios_ui_test in "${ios_ui_tests[@]}"; do
     run_gate repo "ios-ui-$ios_ui_test" "iOS UI: $ios_ui_test" \

@@ -10918,6 +10918,45 @@ final class IdeaForgeCoreTests: XCTestCase {
     }
 
     @MainActor
+    func testConcurrentWorkflowRetryStartsOnlyOneChildRun() async throws {
+        let repository = InMemoryWorkspaceRepository()
+        let store = IdeaForgeStore(state: WorkspaceState.seed(), repository: repository)
+        let failingServices = IdeaForgeServices(
+            transcription: LocalTranscriptionService(),
+            workflow: FailingWorkflowExecutionService(),
+            syncQueue: LocalSyncQueueService(),
+            export: LocalExportService()
+        )
+
+        await store.runWorkflow(templateID: "wf_codex_packet", services: failingServices)
+        let failedRunID = try XCTUnwrap(store.selectedProject?.workflowRuns.first?.id)
+        let blockingWorkflow = BlockingWorkflowExecutionService()
+        let retryServices = IdeaForgeServices(
+            transcription: LocalTranscriptionService(),
+            workflow: blockingWorkflow,
+            syncQueue: LocalSyncQueueService(),
+            export: LocalExportService()
+        )
+
+        let firstRetry = Task { @MainActor in
+            await store.retryWorkflowRun(runID: failedRunID, services: retryServices)
+        }
+        await blockingWorkflow.waitUntilStarted()
+
+        await store.retryWorkflowRun(runID: failedRunID, services: retryServices)
+        XCTAssertEqual(store.lastErrorMessage, "Workflow retry is already in progress.")
+        XCTAssertEqual(store.selectedProject?.workflowRuns.filter { $0.retryOfRunID == failedRunID }.count, 0)
+
+        await blockingWorkflow.release()
+        await firstRetry.value
+
+        let executionCount = await blockingWorkflow.executionCount()
+        XCTAssertEqual(executionCount, 1)
+        XCTAssertEqual(store.selectedProject?.workflowRuns.filter { $0.retryOfRunID == failedRunID }.count, 1)
+        XCTAssertNil(store.lastErrorMessage)
+    }
+
+    @MainActor
     func testCompletedWorkflowRunRetryIsIgnored() async throws {
         let repository = InMemoryWorkspaceRepository()
         let state = WorkspaceState.seed()
@@ -12277,6 +12316,46 @@ private struct ProviderFailingWorkflowExecutionService: WorkflowExecutionService
                 isRetryable: true
             )
         )
+    }
+}
+
+private actor BlockingWorkflowExecutionService: WorkflowExecutionService {
+    private var hasStarted = false
+    private var isReleased = false
+    private var count = 0
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func run(template: WorkflowTemplate, project: IdeaProject) async throws -> [Artifact] {
+        count += 1
+        hasStarted = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+
+        if !isReleased {
+            await withCheckedContinuation { continuation in
+                releaseWaiter = continuation
+            }
+        }
+        return try await LocalWorkflowExecutionService().run(template: template, project: project)
+    }
+
+    func waitUntilStarted() async {
+        guard !hasStarted else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        isReleased = true
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+
+    func executionCount() -> Int {
+        count
     }
 }
 

@@ -18,6 +18,9 @@ final class IdeaForgeiOSUITests: XCTestCase {
             if testName.contains("RecoveredRecording"), !testName.contains("VisualEvidence") {
                 application.launchArguments.append("-uiTestingRecoveredRecording")
             }
+            if testName.contains("AccountPublishWorkspaceExplainsCapabilityGate") {
+                application.launchArguments.append("-uiTestingCapabilityGate")
+            }
             if let fixtureArgument = Self.visualFixtureArgument(for: testName) {
                 application.launchArguments.append(fixtureArgument)
             }
@@ -598,7 +601,11 @@ final class IdeaForgeiOSUITests: XCTestCase {
         XCTAssertTrue(scrollUntilExists(publishButton))
         publishButton.tap()
 
-        XCTAssertTrue(app.staticTexts["Workspace sync needs validated backend capability. Validate backend session before using this backend action."].waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            scrollUntilExists(
+                app.staticTexts["Workspace sync needs validated backend capability. Validate backend session before using this backend action."]
+            )
+        )
     }
 
     func testAccountRefreshWorkspaceExplainsCapabilityGate() {

@@ -162,10 +162,17 @@ def validate_project_wiring(issues: list[str], evidence: list[str]) -> None:
         evidence.append("project.yml wires target-specific AppIcon catalogs through all app targets.")
 
 
-def validate_metadata(issues: list[str], evidence: list[str]) -> None:
-    for path in [METADATA, REVIEW_NOTES, SUPPORT, PRIVACY]:
+def validate_metadata(issues: list[str], evidence: list[str], public_source: bool) -> None:
+    required_documents = [SUPPORT, PRIVACY] if public_source else [METADATA, REVIEW_NOTES, SUPPORT, PRIVACY]
+    for path in required_documents:
         if not path.exists():
             issues.append(f"Missing release document: {path.relative_to(ROOT)}.")
+
+    if public_source:
+        evidence.append(
+            "Public support and privacy documents are present; private App Store metadata is intentionally outside this source snapshot."
+        )
+        return
 
     if not METADATA.exists():
         return
@@ -239,21 +246,59 @@ def validate_screenshot_manifest(issues: list[str], evidence: list[str]) -> None
     evidence.append("Candidate screenshots exist for iOS, macOS, and watchOS.")
 
 
+def parse_accessed_api_reasons(manifest: dict[str, Any]) -> dict[str, set[str]]:
+    accessed_types = manifest.get("NSPrivacyAccessedAPITypes", [])
+    if not isinstance(accessed_types, list):
+        raise ValueError("NSPrivacyAccessedAPITypes must be an array")
+
+    declared_reasons: dict[str, set[str]] = {}
+    for item in accessed_types:
+        if not isinstance(item, dict):
+            raise ValueError("accessed API entries must be dictionaries")
+        category = item.get("NSPrivacyAccessedAPIType")
+        reasons = item.get("NSPrivacyAccessedAPITypeReasons")
+        if not isinstance(category, str) or not isinstance(reasons, list) or not all(
+            isinstance(reason, str) for reason in reasons
+        ):
+            raise ValueError("accessed API declarations must contain a category and string reason array")
+        declared_reasons.setdefault(category, set()).update(reasons)
+    return declared_reasons
+
+
 def validate_privacy_manifests(issues: list[str], evidence: list[str]) -> None:
     manifests = [
         ROOT / "Sources/IdeaForgeMac/PrivacyInfo.xcprivacy",
         ROOT / "Sources/IdeaForgeiOS/PrivacyInfo.xcprivacy",
         ROOT / "Sources/IdeaForgeWatch/PrivacyInfo.xcprivacy",
     ]
+    before = len(issues)
     for path in manifests:
         if not path.exists():
             issues.append(f"Privacy manifest missing: {path.relative_to(ROOT)}.")
             continue
         try:
-            plistlib.loads(path.read_bytes())
+            manifest = plistlib.loads(path.read_bytes())
         except Exception as error:  # noqa: BLE001
             issues.append(f"Privacy manifest is invalid: {path.relative_to(ROOT)} ({error}).")
-    evidence.append("Privacy manifests parse for Mac, iOS, and watchOS.")
+            continue
+        try:
+            declared_reasons = parse_accessed_api_reasons(manifest)
+        except ValueError as error:
+            issues.append(f"Privacy manifest {path.relative_to(ROOT)} is malformed: {error}.")
+            continue
+        expected_reasons = {
+            "NSPrivacyAccessedAPICategoryDiskSpace": "E174.1",
+            "NSPrivacyAccessedAPICategoryUserDefaults": "CA92.1",
+        }
+        for category, reason in expected_reasons.items():
+            if reason not in declared_reasons.get(category, set()):
+                issues.append(
+                    f"Privacy manifest {path.relative_to(ROOT)} must declare {category} reason {reason}."
+                )
+    if len(issues) == before:
+        evidence.append(
+            "Privacy manifests parse and declare required Disk Space and User Defaults reasons for Mac, iOS, and watchOS."
+        )
 
 
 def build_report(issues: list[str], evidence: list[str]) -> str:
@@ -287,13 +332,14 @@ def build_report(issues: list[str], evidence: list[str]) -> str:
     return "\n".join(lines)
 
 
-def validate() -> tuple[list[str], list[str]]:
+def validate(public_source: bool = False) -> tuple[list[str], list[str]]:
     issues: list[str] = []
     evidence: list[str] = []
     validate_icon_catalogs(issues, evidence)
     validate_project_wiring(issues, evidence)
-    validate_metadata(issues, evidence)
-    validate_screenshot_manifest(issues, evidence)
+    validate_metadata(issues, evidence, public_source)
+    if not public_source:
+        validate_screenshot_manifest(issues, evidence)
     validate_privacy_manifests(issues, evidence)
     return issues, evidence
 
@@ -302,9 +348,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", default="build/reports/app-store-assets.json")
     parser.add_argument("--markdown", default="build/reports/app-store-assets.md")
+    parser.add_argument(
+        "--public-source",
+        action="store_true",
+        help="Validate public source assets without private App Store metadata or screenshots.",
+    )
     args = parser.parse_args()
 
-    issues, evidence = validate()
+    issues, evidence = validate(public_source=args.public_source)
     report = build_report(issues, evidence)
     json_path = ROOT / args.json
     markdown_path = ROOT / args.markdown
@@ -314,6 +365,7 @@ def main() -> int:
         json.dumps(
             {
                 "status": "pass" if not issues else "blocked",
+                "profile": "public-source" if args.public_source else "private-release",
                 "issues": issues,
                 "evidence": evidence,
             },

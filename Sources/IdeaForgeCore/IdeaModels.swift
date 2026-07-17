@@ -1234,6 +1234,7 @@ public final class IdeaForgeStore {
     public private(set) var workspaceLoadFailed = false
 
     private let repository: any WorkspaceRepository
+    @ObservationIgnored private var inFlightWorkflowRetryRunIDs: Set<String> = []
 
     public init(
         projects: [IdeaProject],
@@ -3474,6 +3475,13 @@ public final class IdeaForgeStore {
             return
         }
 
+        guard inFlightWorkflowRetryRunIDs.insert(priorRun.id).inserted else {
+            lastErrorMessage = "Workflow retry is already in progress."
+            IdeaForgeLog.workflow.warning("Workflow retry skipped; retry already in progress for \(priorRun.templateID, privacy: .public)")
+            return
+        }
+        defer { inFlightWorkflowRetryRunIDs.remove(priorRun.id) }
+
         if let nextRetryAt = priorRun.nextRetryAt, nextRetryAt > now {
             lastErrorMessage = "Workflow retry is scheduled."
             IdeaForgeLog.workflow.warning("Workflow retry skipped; retry window not due for \(priorRun.templateID, privacy: .public)")
@@ -3489,6 +3497,12 @@ public final class IdeaForgeStore {
             retryAttempt: priorRun.retryAttempt + 1,
             now: now
         )
+        if lastErrorMessage == "Workflow retry is already in progress.",
+           projects.contains(where: { project in
+               project.workflowRuns.contains { $0.retryOfRunID == priorRun.id && $0.status == .completed }
+           }) {
+            lastErrorMessage = nil
+        }
     }
 
     @MainActor
