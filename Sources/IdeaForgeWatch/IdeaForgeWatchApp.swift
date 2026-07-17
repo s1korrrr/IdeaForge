@@ -27,7 +27,7 @@ struct IdeaForgeWatchApp: App {
         WindowGroup {
             WatchCaptureView(store: store, transferService: recordingTransferService)
                 .onAppear {
-                    IdeaForgeLog.lifecycle.info("watchOS app appeared")
+                    IdeaForgeLog.lifecycle.notice("watchOS app appeared")
                 }
         }
     }

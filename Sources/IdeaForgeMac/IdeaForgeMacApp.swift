@@ -16,7 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         applyUITestingWindowPresetIfNeeded()
-        IdeaForgeLog.lifecycle.info("macOS app launched")
+        IdeaForgeLog.lifecycle.notice("macOS app launched")
     }
 
     private func applyUITestingWindowPresetIfNeeded() {

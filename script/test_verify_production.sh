@@ -75,6 +75,14 @@ fi
 grep -Fq 'Runtime crash/retry-loop/persistence log analysis' "$VERIFIER"
 grep -Fq 'Verification inputs remained stable during the run' "$VERIFIER"
 grep -Fq 'verification-inputs-before.sha256' "$VERIFIER"
+grep -Fq 'Package.swift project.yml README.md Sources Tests script docs .github' "$VERIFIER"
+grep -Fq 'testIdeasAgentAndQuestionAnswerFlow' "$VERIFIER"
+grep -Fq 'NSPrivacyAccessedAPICategoryDiskSpace' "$VERIFIER"
+grep -Fq '<string>E174.1</string>' "$VERIFIER"
+grep -Fq 'NSPrivacyAccessedAPICategoryUserDefaults' "$VERIFIER"
+grep -Fq '<string>CA92.1</string>' "$VERIFIER"
+grep -Fq 'validate_app_store_assets.py" --public-source' "$VERIFIER"
+grep -Fq 'Private App Store metadata and screenshots' "$VERIFIER"
 
 for direct_release_contract in \
   'RUN_DIRECT_MAC_RELEASE="${RUN_DIRECT_MAC_RELEASE:-0}"' \

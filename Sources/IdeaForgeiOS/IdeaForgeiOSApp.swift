@@ -99,7 +99,7 @@ struct IdeaForgeiOSApp: App {
             )
             .preferredColorScheme(Self.uiTestingPreferredColorScheme)
             .onAppear {
-                IdeaForgeLog.lifecycle.info("iOS app appeared")
+                IdeaForgeLog.lifecycle.notice("iOS app appeared")
                 recordingTransferService.activate()
                 backgroundUploadCoordinator.reconcileCompletedBackgroundUploads()
                 backgroundUploadCoordinator.scheduleIfNeeded()
@@ -179,6 +179,11 @@ struct IdeaForgeiOSApp: App {
     }
 
     private static func makeStore() -> IdeaForgeStore {
+        if ProcessInfo.processInfo.arguments.contains("-uiTestingCapabilityGate") {
+            let store = SampleData.taskFirstStore(state: .clean)
+            store.setPrivacyMode(.standardCloud)
+            return store
+        }
         if ProcessInfo.processInfo.arguments.contains("-uiTestingClean") {
             return SampleData.taskFirstStore(state: .clean)
         }

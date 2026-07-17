@@ -13,6 +13,7 @@ xcuserdata/
 .idea/
 .vscode/
 .codex/
+.cursor/
 .superpowers/
 *.xcresult/
 __pycache__/
