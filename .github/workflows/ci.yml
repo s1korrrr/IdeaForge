@@ -21,6 +21,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Select Xcode 26.6
@@ -60,6 +61,8 @@ jobs:
           python3 script/test_audit_public_source.py
           python3 script/test_create_public_source_snapshot.py
           python3 script/test_ci_release_config.py
+          python3 script/test_sparkle_configuration.py
+          python3 script/audit_public_git_metadata.py --new-only
           python3 script/test_validate_app_store_assets.py
           ./script/test_release_macos.sh
           ./script/test_verify_production.sh
@@ -77,7 +80,7 @@ jobs:
             --json-out .build/reports/public-source-audit.json \
             --markdown-out .build/reports/public-source-audit.md
 
-      - name: Build unsigned Mac community app
+      - name: Build unsigned Apple apps
         shell: bash
         run: |
           set -euo pipefail
@@ -87,13 +90,33 @@ jobs:
             -configuration Debug \
             -derivedDataPath DerivedData-ci-mac \
             CODE_SIGNING_ALLOWED=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            build
+          xcodebuild -quiet \
+            -project IdeaForge.xcodeproj \
+            -scheme IdeaForgeiOS \
+            -configuration Debug \
+            -derivedDataPath DerivedData-ci-ios \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            build
+          xcodebuild -quiet \
+            -project IdeaForge.xcodeproj \
+            -scheme IdeaForgeWatch \
+            -configuration Debug \
+            -derivedDataPath DerivedData-ci-watch \
+            -destination 'generic/platform=watchOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
             build
 
       - name: Prove verification did not modify tracked source
         shell: bash
         run: |
           set -euo pipefail
-          test -z "$(git status --porcelain --untracked-files=all)"
+          worktree_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$worktree_status"
 
       - name: Upload audit reports
         if: always()

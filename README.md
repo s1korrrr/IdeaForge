@@ -5,6 +5,11 @@
 
 IdeaForge is a native Mac, iPhone, and Apple Watch workspace for turning spoken ideas into transcripts, plans, validation work, and reviewable engineering packets. The repository contains the Apple clients, shared Swift core, tests, release tooling, and a single-node community backend for development and personal evaluation.
 
+**Project status:** pre-1.0 and under active development. The source tree is
+public, but no official binary release has been published. APIs, backend
+contracts, and persisted formats may change before 1.0; versioned changes are
+tracked in [CHANGELOG.md](CHANGELOG.md).
+
 The project does not include a deployed production service. Cloud AI, cross-device backend sync, account plans, and web account management require a backend that implements the documented contract.
 
 ## Download for Mac
@@ -32,6 +37,10 @@ xcodebuild \
 A source build is a community build. Distributors must use their own bundle identifiers, product name, artwork, signing identity, and update feed. The [trademark policy](TRADEMARKS.md) explains how to describe forks.
 
 [docs/BUILDING.md](docs/BUILDING.md) covers every platform and the test commands.
+
+`Package.swift` exposes `IdeaForgeCore` so the shared logic can be built and
+tested without Xcode. It is an internal, pre-stable project surface rather than
+a supported third-party library API.
 
 ## What works without a backend
 

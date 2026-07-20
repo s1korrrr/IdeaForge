@@ -15,6 +15,7 @@ import unittest
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 AUDITOR = SCRIPT_DIR / "audit_public_source.py"
+SPARKLE_LICENSE = SCRIPT_DIR.parent / "ThirdPartyLicenses/Sparkle-2.9.4-LICENSE.txt"
 
 
 class PublicSourceAuditTests(unittest.TestCase):
@@ -106,6 +107,20 @@ class PublicSourceAuditTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assert_single_finding(report, "gmail_address")
+
+    def test_allows_only_hash_verified_verbatim_third_party_license(self) -> None:
+        license_bytes = SPARKLE_LICENSE.read_bytes()
+        destination = "ThirdPartyLicenses/Sparkle-2.9.4-LICENSE.txt"
+        self.write(destination, license_bytes)
+        allowed_result, allowed_report = self.run_audit()
+        self.assertEqual(allowed_result.returncode, 0, allowed_result.stderr)
+        self.assertEqual(allowed_report["finding_count"], 0)
+
+        self.write(destination, license_bytes + b"\nlocal edit\n")
+        rejected_result, rejected_report = self.run_audit()
+        self.assertNotEqual(rejected_result.returncode, 0)
+        categories = {finding["category"] for finding in rejected_report["findings"]}
+        self.assertIn("gmail_address", categories)
 
     def test_rejects_physical_udid(self) -> None:
         udid = "00008120" + "-001210A13C92201E"

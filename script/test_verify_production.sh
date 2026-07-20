@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERIFIER="$ROOT_DIR/script/verify_production.sh"
 
+grep -Fq 'XCODEGEN_BIN="${XCODEGEN_BIN:-xcodegen}"' "$VERIFIER"
+grep -Fq 'PYTHON_BIN="${PYTHON_BIN:-python3}"' "$VERIFIER"
+grep -Fq 'command -v "$XCODEGEN_BIN"' "$VERIFIER"
+grep -Fq 'command -v "$PYTHON_BIN"' "$VERIFIER"
+grep -A6 -F 'macOS warnings-as-errors build' "$VERIFIER" | grep -F 'CODE_SIGNING_ALLOWED=NO' >/dev/null
+grep -A6 -F 'iOS generic device warnings-as-errors build' "$VERIFIER" | grep -F 'CODE_SIGNING_ALLOWED=NO' >/dev/null
+
 grep -Fq 'generic/platform=iOS' "$VERIFIER"
 grep -Fq 'iOS generic device warnings-as-errors build' "$VERIFIER"
 grep -Fq 'resolve_watch_simulator.py' "$VERIFIER"

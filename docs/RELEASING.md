@@ -47,7 +47,8 @@ The workflow creates a temporary Keychain, imports the certificate, validates an
 
 1. Set `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in `project.yml`.
 2. Generate `IdeaForge.xcodeproj` with XcodeGen 2.45.4.
-3. Update release notes and the appcast entry.
+3. Update `CHANGELOG.md` and `docs/releases/<version>.md`. The protected
+   workflow generates the signed appcast entry from the verified archive.
 4. Run the full test and public-source audit matrix.
 5. Commit all release inputs. Confirm `git status --porcelain --untracked-files=all` is empty.
 6. Create and push the exact `v<version>` tag only after reviewing the commit.
@@ -89,6 +90,10 @@ dist/release/notary/
 
 The script stores sanitized notary results. It discards raw response output and never accepts raw Apple credential environment variables.
 
+The app embedded in both the DMG and update ZIP contains `LICENSE`, `NOTICE`,
+`THIRD_PARTY_NOTICES.md`, and Sparkle's complete upstream license inventory in
+its resources. Treat omission of any of these files as a packaging failure.
+
 ## Independent verification
 
 Before publishing, verify both the extracted app and mounted DMG:
@@ -106,7 +111,7 @@ Test first launch and update installation on a second clean Mac or clean macOS u
 
 ## Publish
 
-The protected release workflow must upload the DMG, ZIP, checksums, manifest, sanitized notary reports, SBOM, and GitHub artifact attestations. It must sign the ZIP with Sparkle's EdDSA key and publish an appcast entry that matches the ZIP length, version, download URL, and signature.
+The protected release workflow must upload the DMG, ZIP, checksums, manifest, sanitized notary reports, SBOM, and GitHub artifact attestations. It must sign the ZIP with Sparkle's EdDSA key and publish an appcast entry that matches the ZIP length, version, download URL, and signature. The workflow creates the GitHub release as a draft from the reviewed versioned notes, updates and verifies the appcast, and only then publishes the release.
 
 Do not publish a release when any required signature, notary status, staple validation, Gatekeeper assessment, checksum, attestation, or appcast field is missing. Keep a failed tag unpublished or mark the GitHub release as a draft until the exact commit passes.
 

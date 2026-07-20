@@ -159,6 +159,14 @@ xcodebuild \
 
 EXPORTED_APP="$EXPORT_PATH/IdeaForge.app"
 [[ -d "$EXPORTED_APP" ]] || fail "Developer ID export did not produce IdeaForge.app"
+for legal_resource in \
+  LICENSE \
+  NOTICE \
+  THIRD_PARTY_NOTICES.md \
+  ThirdPartyLicenses/Sparkle-2.9.4-LICENSE.txt; do
+  [[ -f "$EXPORTED_APP/Contents/Resources/$legal_resource" ]] \
+    || fail "exported application omitted required legal resource: $legal_resource"
+done
 
 audit_code_signature() {
   local target="$1"

@@ -85,6 +85,12 @@ DETERMINISTIC_TEXT_FIXTURES = frozenset(
         ),
     }
 )
+# Upstream legal text must remain verbatim, including author contact details.
+# The exact hash prevents this narrow exception from masking edited content.
+VERBATIM_THIRD_PARTY_LICENSES = {
+    "ThirdPartyLicenses/Sparkle-2.9.4-LICENSE.txt":
+        "389a4e4e9a32f059775b13a06e25a591445ba229d2838d26dd3e7c0c45127cfe",
+}
 
 TEXT_PATTERNS = (
     (
@@ -257,12 +263,18 @@ def audit(args: argparse.Namespace) -> dict[str, object]:
             )
 
         data = path.read_bytes()
+        verbatim_license = (
+            relative_path in VERBATIM_THIRD_PARTY_LICENSES
+            and hashlib.sha256(data).hexdigest() == VERBATIM_THIRD_PARTY_LICENSES[relative_path]
+        )
         text = data.decode("utf-8", errors="replace")
         for line_number, line in enumerate(text.splitlines(), start=1):
             for category, pattern, message in TEXT_PATTERNS:
                 for match in pattern.finditer(line):
                     value = match.group(0)
                     if (relative_path, category, value) in DETERMINISTIC_TEXT_FIXTURES:
+                        continue
+                    if verbatim_license and category == "gmail_address":
                         continue
                     findings.append(finding(category, relative_path, message, line_number))
 
