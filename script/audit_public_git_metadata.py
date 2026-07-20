@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
 
     unexpected = exposed - baseline
     stale = baseline - exposed
-    if stale:
+    if stale and args.new_only:
         print("Legacy metadata baseline contains commits that are no longer exposed; remove them.", file=sys.stderr)
         return 2
     for commit in sorted(exposed):
