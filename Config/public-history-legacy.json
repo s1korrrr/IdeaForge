@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "legacy_commits": [
+    "5f69c6ab501df97a8c77b780da836c487dbd6ea4",
+    "0a3195a1e8739cd1ed2f5a70c8d4038963fd8ca5",
+    "af4d238ca4e33c959e5f34bf663aa8aa08829c40"
+  ],
+  "note": "Known public owner-email metadata pending explicit history-rewrite approval. Do not add entries."
+}

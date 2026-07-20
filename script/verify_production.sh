@@ -3,8 +3,16 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT="$ROOT_DIR/IdeaForge.xcodeproj"
-XCODEGEN_BIN="${XCODEGEN_BIN:-/opt/homebrew/bin/xcodegen}"
-PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3}"
+XCODEGEN_BIN="${XCODEGEN_BIN:-xcodegen}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+command -v "$XCODEGEN_BIN" >/dev/null 2>&1 || {
+  echo "Missing XcodeGen executable: $XCODEGEN_BIN" >&2
+  exit 2
+}
+command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
+  echo "Missing Python executable: $PYTHON_BIN" >&2
+  exit 2
+}
 IOS_DESTINATION="${IOS_DESTINATION:-platform=iOS Simulator,name=iPhone 17,OS=26.5}"
 WATCH_GENERIC_DESTINATION="${WATCH_GENERIC_DESTINATION:-generic/platform=watchOS Simulator}"
 WATCH_ULTRA_DESTINATION="${WATCH_ULTRA_DESTINATION:-}"
@@ -725,12 +733,14 @@ run_gate repo mac-build "macOS warnings-as-errors build" \
   xcodebuild -project "$PROJECT" -scheme IdeaForgeMac -configuration Debug \
   -derivedDataPath "$MAC_DERIVED_DATA" -destination "platform=macOS" \
   -resultBundlePath "$ARTIFACT_DIR/xcresults/mac-build.xcresult" \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
   SWIFT_TREAT_WARNINGS_AS_ERRORS=YES build
 
 run_gate repo ios-generic-build "iOS generic device warnings-as-errors build" \
   xcodebuild -project "$PROJECT" -scheme IdeaForgeiOS -configuration Debug \
   -derivedDataPath "$IOS_GENERIC_DERIVED_DATA" -destination "generic/platform=iOS" \
   -resultBundlePath "$ARTIFACT_DIR/xcresults/ios-generic-build.xcresult" \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
   SWIFT_TREAT_WARNINGS_AS_ERRORS=YES build
 
 run_gate repo ios-build "iOS simulator warnings-as-errors build" \

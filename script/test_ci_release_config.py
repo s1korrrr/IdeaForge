@@ -18,6 +18,7 @@ RELEASE = ROOT / ".github/workflows/release-macos.yml"
 DEPENDABOT = ROOT / ".github/dependabot.yml"
 APPCAST = ROOT / "updates/appcast.xml"
 SBOM = ROOT / "script/generate_sbom.py"
+METADATA_AUDIT = ROOT / "script/audit_public_git_metadata.py"
 
 
 class CIReleaseConfigurationTests(unittest.TestCase):
@@ -26,6 +27,8 @@ class CIReleaseConfigurationTests(unittest.TestCase):
         self.assertIn("permissions:\n  contents: read", text)
         self.assertIn("pull_request:", text)
         self.assertIn("push:", text)
+        self.assertIn("fetch-depth: 0", text)
+        self.assertIn("audit_public_git_metadata.py --new-only", text)
         self.assertIn("runs-on: macos-26", text)
         self.assertIn("/Applications/Xcode_26.6.app", text)
         self.assertIn("9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0", text)
@@ -34,6 +37,7 @@ class CIReleaseConfigurationTests(unittest.TestCase):
         for command in (
             "swift test",
             "test_audit_public_source.py",
+            "test_audit_public_git_metadata.py",
             "test_create_public_source_snapshot.py",
             "test_release_macos.sh",
             "test_verify_production.sh",
@@ -43,6 +47,20 @@ class CIReleaseConfigurationTests(unittest.TestCase):
             "test -f IdeaForge.xcodeproj/project.pbxproj",
         ):
             self.assertIn(command, text)
+
+    def test_workflows_fail_closed_on_clean_tree_checks_and_cover_all_app_targets(self) -> None:
+        ci = CI.read_text(encoding="utf-8")
+        release = RELEASE.read_text(encoding="utf-8")
+
+        for workflow in (ci, release):
+            self.assertNotIn('test -z "$(git status --porcelain --untracked-files=all)"', workflow)
+            self.assertIn('worktree_status="$(git status --porcelain --untracked-files=all)"', workflow)
+            self.assertIn('test -z "$worktree_status"', workflow)
+            self.assertIn("python3 script/test_sparkle_configuration.py", workflow)
+
+        for scheme in ("IdeaForgeMac", "IdeaForgeiOS", "IdeaForgeWatch"):
+            self.assertIn(f"-scheme {scheme}", ci)
+        self.assertGreaterEqual(ci.count("SWIFT_TREAT_WARNINGS_AS_ERRORS=YES"), 3)
 
     def test_release_uses_protected_environment_and_short_lived_secrets(self) -> None:
         text = RELEASE.read_text(encoding="utf-8")
@@ -82,6 +100,27 @@ class CIReleaseConfigurationTests(unittest.TestCase):
             self.assertIn(boundary, text)
         self.assertNotIn("APPLE_APP_SPECIFIC_PASSWORD", text)
         self.assertNotIn("pull_request_target", text)
+        self.assertIn("audit_public_git_metadata.py --strict", text)
+        self.assertIn('--draft \\', text)
+        self.assertIn('--notes-file "$release_notes"', text)
+        self.assertNotIn("--generate-notes", text)
+        self.assertLess(text.index("--draft \\"), text.index("contents/updates/appcast.xml"))
+
+    def test_public_history_gate_acknowledges_but_does_not_hide_legacy_exposure(self) -> None:
+        new_only = subprocess.run(
+            [sys.executable, str(METADATA_AUDIT), "--new-only"],
+            capture_output=True,
+            text=True,
+        )
+        strict = subprocess.run(
+            [sys.executable, str(METADATA_AUDIT), "--strict"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(new_only.returncode, 0, new_only.stderr)
+        self.assertNotEqual(strict.returncode, 0)
+        self.assertIn("3 acknowledged legacy exposure(s)", new_only.stdout)
+        self.assertIn("legacy metadata still requires remediation", strict.stderr)
 
     def test_dependabot_tracks_pinned_github_actions(self) -> None:
         text = DEPENDABOT.read_text(encoding="utf-8")
@@ -114,13 +153,14 @@ class CIReleaseConfigurationTests(unittest.TestCase):
             self.assertEqual(packages["Sparkle"]["versionInfo"], "2.9.4")
             self.assertEqual(packages["Sparkle"]["licenseConcluded"], "MIT")
             self.assertEqual(
+                packages["Sparkle"]["externalRefs"][1]["referenceLocator"],
+                "git+https://github.com/sparkle-project/Sparkle@b6496a74a087257ef5e6da1c5b29a447a60f5bd7",
+            )
+            self.assertEqual(
                 packages["Sparkle"]["checksums"][0]["checksumValue"],
                 "cb6fdbdc8884f15d62a616e79face92b08322410fd2d425edc6596ccbf4ba3b0",
             )
-            self.assertIn(
-                "Sparkle@2.9.4",
-                packages["Sparkle"]["externalRefs"][1]["referenceLocator"],
-            )
+            self.assertIn("Sparkle@2.9.4", packages["Sparkle"]["externalRefs"][0]["referenceLocator"])
 
     def test_sbom_generator_rejects_version_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

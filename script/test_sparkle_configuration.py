@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import plistlib
 import unittest
 from pathlib import Path
@@ -17,6 +18,11 @@ ENTITLEMENTS_PATH = ROOT / "Sources/IdeaForgeMac/IdeaForgeMac.entitlements"
 PACKAGE_SWIFT_PATH = ROOT / "Package.swift"
 APP_UPDATER_PATH = ROOT / "Sources/IdeaForgeMac/AppUpdater.swift"
 MAC_APP_PATH = ROOT / "Sources/IdeaForgeMac/IdeaForgeMacApp.swift"
+IOS_INFO_PLIST_PATH = ROOT / "Sources/IdeaForgeiOS/Info.plist"
+WATCH_INFO_PLIST_PATH = ROOT / "Sources/IdeaForgeWatch/Info.plist"
+SPARKLE_LICENSE_PATH = ROOT / "ThirdPartyLicenses/Sparkle-2.9.4-LICENSE.txt"
+SPARKLE_REVISION = "b6496a74a087257ef5e6da1c5b29a447a60f5bd7"
+SPARKLE_LICENSE_SHA256 = "389a4e4e9a32f059775b13a06e25a591445ba229d2838d26dd3e7c0c45127cfe"
 
 
 def yaml_block(source: str, heading: str, indent: int) -> str:
@@ -49,8 +55,11 @@ class SparkleConfigurationTests(unittest.TestCase):
             sparkle_package,
             r"(?m)^    url: https://github\.com/sparkle-project/Sparkle$",
         )
-        self.assertRegex(sparkle_package, r'(?m)^    exactVersion: "?2\.9\.4"?$')
-        self.assertNotRegex(sparkle_package, r"(?m)^    (from|version|branch|revision):")
+        self.assertRegex(
+            sparkle_package,
+            rf'(?m)^    revision: "?{SPARKLE_REVISION}"? # Sparkle 2\.9\.4$',
+        )
+        self.assertNotRegex(sparkle_package, r"(?m)^    (from|version|branch|exactVersion):")
 
         mac_target = yaml_block(project, "IdeaForgeMac", 2)
         self.assertRegex(mac_target, r"(?m)^      - package: Sparkle$")
@@ -88,6 +97,19 @@ class SparkleConfigurationTests(unittest.TestCase):
             32,
             "SUPublicEDKey must encode a 32-byte EdDSA public key",
         )
+
+        for plist_path in (IOS_INFO_PLIST_PATH, WATCH_INFO_PLIST_PATH):
+            with plist_path.open("rb") as plist_file:
+                platform_info = plistlib.load(plist_file)
+            self.assertEqual(platform_info.get("CFBundleShortVersionString"), "$(MARKETING_VERSION)")
+            self.assertEqual(platform_info.get("CFBundleVersion"), "$(CURRENT_PROJECT_VERSION)")
+
+        self.assertEqual(
+            hashlib.sha256(SPARKLE_LICENSE_PATH.read_bytes()).hexdigest(),
+            SPARKLE_LICENSE_SHA256,
+        )
+        notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+        self.assertIn("ThirdPartyLicenses/Sparkle-2.9.4-LICENSE.txt", notices)
 
         with ENTITLEMENTS_PATH.open("rb") as plist_file:
             entitlements = plistlib.load(plist_file)

@@ -15,6 +15,7 @@ import sys
 
 EXPECTED_SPARKLE_LOCATION = "https://github.com/sparkle-project/Sparkle"
 EXPECTED_SPARKLE_VERSION = "2.9.4"
+EXPECTED_SPARKLE_REVISION = "b6496a74a087257ef5e6da1c5b29a447a60f5bd7"
 EXPECTED_SPARKLE_SPM_ARCHIVE_SHA256 = "cb6fdbdc8884f15d62a616e79face92b08322410fd2d425edc6596ccbf4ba3b0"
 
 
@@ -34,21 +35,25 @@ def project_version(root: Path) -> str:
     return match.group(1)
 
 
-def sparkle_pin(root: Path) -> tuple[str, str]:
+def sparkle_pin(root: Path) -> tuple[str, str, str]:
     text = (root / "project.yml").read_text(encoding="utf-8")
     match = re.search(
         r"^\s{2}Sparkle:\s*$\n"
         r"^\s{4}url:\s*(\S+)\s*$\n"
-        r"^\s{4}exactVersion:\s*([^\s]+)\s*$",
+        r"^\s{4}revision:\s*([0-9a-f]{40})(?:\s+#\s+Sparkle\s+([^\s]+))?\s*$",
         text,
         flags=re.MULTILINE,
     )
     if match is None:
-        raise ValueError("project.yml must contain one exact Sparkle package pin")
-    location, version = match.groups()
-    if location != EXPECTED_SPARKLE_LOCATION or version != EXPECTED_SPARKLE_VERSION:
+        raise ValueError("project.yml must contain one immutable Sparkle revision pin")
+    location, revision, version = match.groups()
+    if (
+        location != EXPECTED_SPARKLE_LOCATION
+        or revision != EXPECTED_SPARKLE_REVISION
+        or version != EXPECTED_SPARKLE_VERSION
+    ):
         raise ValueError("Sparkle pin does not match project.yml release policy")
-    return location, version
+    return location, version, revision
 
 
 def source_commit(root: Path) -> str:
@@ -89,7 +94,7 @@ def build_document(root: Path, version: str) -> dict[str, object]:
     configured_version = project_version(root)
     if version != configured_version:
         raise ValueError(f"version {version} does not match project.yml {configured_version}")
-    sparkle_location, sparkle_version = sparkle_pin(root)
+    sparkle_location, sparkle_version, sparkle_revision = sparkle_pin(root)
     commit = source_commit(root)
     return {
         "SPDXID": "SPDXRef-DOCUMENT",
@@ -143,7 +148,7 @@ def build_document(root: Path, version: str) -> dict[str, object]:
                     {
                         "referenceCategory": "OTHER",
                         "referenceType": "vcs",
-                        "referenceLocator": f"git+{sparkle_location}@{sparkle_version}",
+                        "referenceLocator": f"git+{sparkle_location}@{sparkle_revision}",
                     },
                 ],
             },

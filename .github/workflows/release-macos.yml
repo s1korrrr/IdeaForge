@@ -76,6 +76,8 @@ jobs:
           python3 script/test_audit_public_source.py
           python3 script/test_create_public_source_snapshot.py
           python3 script/test_ci_release_config.py
+          python3 script/test_sparkle_configuration.py
+          python3 script/audit_public_git_metadata.py --strict
           python3 script/test_validate_app_store_assets.py
           ./script/test_release_macos.sh
           ./script/test_verify_production.sh
@@ -85,7 +87,8 @@ jobs:
             --profile public \
             --json-out .build/reports/public-source-audit.json \
             --markdown-out .build/reports/public-source-audit.md
-          test -z "$(git status --porcelain --untracked-files=all)"
+          worktree_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$worktree_status"
           echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -264,9 +267,12 @@ jobs:
             echo "Release already exists: $RELEASE_TAG" >&2
             exit 1
           fi
+          release_notes="docs/releases/$RELEASE_VERSION.md"
+          test -s "$release_notes"
           gh release create "$RELEASE_TAG" \
             --verify-tag \
-            --generate-notes \
+            --draft \
+            --notes-file "$release_notes" \
             --title "IdeaForge $RELEASE_VERSION" \
             "dist/release/IdeaForge-$RELEASE_VERSION.dmg" \
             "dist/release/IdeaForge-$RELEASE_VERSION.zip" \
@@ -294,8 +300,7 @@ jobs:
             --method PUT \
             "repos/$GITHUB_REPOSITORY/contents/updates/appcast.xml" \
             --input "$RUNNER_TEMP/appcast-update.json" >/dev/null; then
-            gh release edit "$RELEASE_TAG" --draft
-            echo "Appcast publication failed; the GitHub release was returned to draft state." >&2
+            echo "Appcast publication failed; the GitHub release remains a draft." >&2
             exit 1
           fi
           gh release edit "$RELEASE_TAG" --draft=false
