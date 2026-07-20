@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -41,6 +42,30 @@ def legacy_commits(path: Path) -> set[str]:
     return set(commits)
 
 
+def synthetic_pull_request_merge_commit(root: Path) -> set[str]:
+    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+        return set()
+    github_ref = os.environ.get("GITHUB_REF", "")
+    if not (github_ref.startswith("refs/pull/") and github_ref.endswith("/merge")):
+        return set()
+    github_sha = os.environ.get("GITHUB_SHA", "")
+    head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if github_sha != head:
+        return set()
+    parent_record = subprocess.run(
+        ["git", "-C", str(root), "rev-list", "--parents", "-n", "1", head],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    return {head} if len(parent_record) == 3 else set()
+
+
 def exposed_commits(root: Path) -> set[str]:
     result = subprocess.run(
         [
@@ -72,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         root = args.root.resolve(strict=True)
         baseline = legacy_commits(args.baseline.resolve(strict=True))
-        exposed = exposed_commits(root)
+        exposed = exposed_commits(root) - synthetic_pull_request_merge_commit(root)
     except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
         print(f"audit_public_git_metadata.py: {error}", file=sys.stderr)
         return 2

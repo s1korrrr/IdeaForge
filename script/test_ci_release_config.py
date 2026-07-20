@@ -37,6 +37,7 @@ class CIReleaseConfigurationTests(unittest.TestCase):
         for command in (
             "swift test",
             "test_audit_public_source.py",
+            "test_audit_public_git_metadata.py",
             "test_create_public_source_snapshot.py",
             "test_release_macos.sh",
             "test_verify_production.sh",
